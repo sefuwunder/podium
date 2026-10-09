@@ -111,6 +111,12 @@ export function initDb() {
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
     );
+    -- Phase 1: talent & pod allocation engine
+    CREATE TABLE IF NOT EXISTS conflicts (
+      id TEXT PRIMARY KEY, person_id TEXT NOT NULL, company TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_conflicts_person ON conflicts(person_id);
   `);
   // Column migrations for existing installs (PRAGMA-style).
   const ensureColumn = (table: string, name: string, ddl: string) => {
@@ -125,35 +131,107 @@ export function initDb() {
   ensureColumn("pods", "stripe_subscription_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("pods", "clickup_list_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("people", "booking_slug", "TEXT");
+  // Phase 1: talent & pod allocation engine
+  ensureColumn("people", "max_weekly_hours", "REAL");
+  ensureColumn("people", "skills", "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn("people", "rate_tier", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("people", "bio", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("pod_members", "allocated_hours", "REAL");
+  ensureColumn("pods", "match_slug", "TEXT");
+  ensureColumn("pods", "match_visible", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("pods", "match_blurb", "TEXT NOT NULL DEFAULT ''");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pods_match_slug ON pods(match_slug) WHERE match_slug IS NOT NULL");
   seedTemplates();
 }
 
 // ---------- people ----------
-export interface Person { id: string; name: string; email: string; title: string; hourly_rate_cents: number; booking_slug: string | null; created_at: string; }
-export const listPeople = () => db.query("SELECT * FROM people ORDER BY name COLLATE NOCASE").all() as Person[];
-export const getPerson = (id: string) => (db.query("SELECT * FROM people WHERE id = ?").get(id) as Person) || null;
-export function createPerson(p: { name: string; email?: string; title?: string; hourly_rate_cents?: number }): Person {
+export interface Person {
+  id: string; name: string; email: string; title: string; hourly_rate_cents: number;
+  booking_slug: string | null; created_at: string;
+  max_weekly_hours: number | null; skills: string[]; rate_tier: string; bio: string;
+}
+export const RATE_TIERS = ["", "I", "II", "III", "$", "$$", "$$$"];
+/** Normalize a skills input (array or comma-separated string) → deduped trimmed list. */
+export function normalizeSkills(input: unknown): string[] {
+  const raw: unknown[] = Array.isArray(input)
+    ? input
+    : String(input || "").split(",");
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of raw) {
+    const t = String(s || "").trim();
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out.slice(0, 24);
+}
+function parseSkillsJSON(raw: any): string[] {
+  try {
+    const a = JSON.parse(raw || "[]");
+    return normalizeSkills(Array.isArray(a) ? a : []);
+  } catch { return []; }
+}
+function personRow(r: any): Person {
+  return { ...r, skills: parseSkillsJSON(r.skills) };
+}
+function validRateTier(t: unknown): string {
+  const tier = String(t || "").trim();
+  if (!RATE_TIERS.includes(tier)) throw Object.assign(new Error("rate_tier must be one of I, II, III, $, $$, $$$"), { status: 400 });
+  return tier;
+}
+function validMaxWeeklyHours(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) throw Object.assign(new Error("max_weekly_hours must be a positive number"), { status: 400 });
+  return Math.round(n * 100) / 100;
+}
+export const listPeople = () =>
+  (db.query("SELECT * FROM people ORDER BY name COLLATE NOCASE").all() as any[]).map(personRow);
+export const getPerson = (id: string) => {
+  const r = db.query("SELECT * FROM people WHERE id = ?").get(id) as any;
+  return r ? personRow(r) : null;
+};
+export function createPerson(p: {
+  name: string; email?: string; title?: string; hourly_rate_cents?: number;
+  max_weekly_hours?: number | null; skills?: string[] | string; rate_tier?: string; bio?: string;
+}): Person {
   if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
   const rate = Math.round(Number(p.hourly_rate_cents) || 0);
   if (rate < 0) throw Object.assign(new Error("hourly_rate_cents must be >= 0"), { status: 400 });
-  const row: Person = { id: uid(), name: p.name.trim(), email: (p.email || "").trim(), title: (p.title || "").trim(), hourly_rate_cents: rate, booking_slug: null, created_at: nowIso() };
-  db.query("INSERT INTO people (id, name, email, title, hourly_rate_cents, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .run(row.id, row.name, row.email, row.title, row.hourly_rate_cents, row.created_at);
-  return row;
+  const row = {
+    id: uid(), name: p.name.trim(), email: (p.email || "").trim(), title: (p.title || "").trim(),
+    hourly_rate_cents: rate, booking_slug: null as string | null, created_at: nowIso(),
+    max_weekly_hours: validMaxWeeklyHours(p.max_weekly_hours),
+    skills: JSON.stringify(normalizeSkills(p.skills)),
+    rate_tier: validRateTier(p.rate_tier),
+    bio: String(p.bio || "").trim().slice(0, 600),
+  };
+  db.query("INSERT INTO people (id, name, email, title, hourly_rate_cents, booking_slug, created_at, max_weekly_hours, skills, rate_tier, bio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.name, row.email, row.title, row.hourly_rate_cents, row.booking_slug, row.created_at,
+      row.max_weekly_hours, row.skills, row.rate_tier, row.bio);
+  return getPerson(row.id)!;
 }
-export function updatePerson(id: string, p: Partial<Person>): Person | null {
+export function updatePerson(id: string, p: Partial<Person> & { skills?: string[] | string }): Person | null {
   const cur = getPerson(id); if (!cur) return null;
   const row = {
     name: (p.name ?? cur.name).trim() || cur.name,
     email: (p.email ?? cur.email).trim(),
     title: (p.title ?? cur.title).trim(),
     hourly_rate_cents: p.hourly_rate_cents == null ? cur.hourly_rate_cents : Math.max(0, Math.round(Number(p.hourly_rate_cents) || 0)),
+    max_weekly_hours: p.max_weekly_hours === undefined ? cur.max_weekly_hours : validMaxWeeklyHours(p.max_weekly_hours),
+    skills: JSON.stringify(p.skills === undefined ? cur.skills : normalizeSkills(p.skills)),
+    rate_tier: p.rate_tier === undefined ? cur.rate_tier : validRateTier(p.rate_tier),
+    bio: String(p.bio ?? cur.bio).trim().slice(0, 600),
   };
-  db.query("UPDATE people SET name = ?, email = ?, title = ?, hourly_rate_cents = ? WHERE id = ?")
-    .run(row.name, row.email, row.title, row.hourly_rate_cents, id);
+  db.query("UPDATE people SET name = ?, email = ?, title = ?, hourly_rate_cents = ?, max_weekly_hours = ?, skills = ?, rate_tier = ?, bio = ? WHERE id = ?")
+    .run(row.name, row.email, row.title, row.hourly_rate_cents, row.max_weekly_hours, row.skills, row.rate_tier, row.bio, id);
   return getPerson(id);
 }
 export function deletePerson(id: string): boolean {
+  db.query("DELETE FROM conflicts WHERE person_id = ?").run(id);
   return db.query("DELETE FROM people WHERE id = ?").run(id).changes > 0;
 }
 
@@ -163,6 +241,7 @@ export interface Pod {
   billing_type: string; retainer_hours: number | null; retainer_rate_cents: number;
   slack_channel_id: string; stripe_customer_id: string; stripe_subscription_id: string;
   clickup_list_id: string;
+  match_slug: string | null; match_visible: number; match_blurb: string;
 }
 export const listPods = () => db.query("SELECT * FROM pods ORDER BY name COLLATE NOCASE").all() as Pod[];
 export const getPod = (id: string) => (db.query("SELECT * FROM pods WHERE id = ?").get(id) as Pod) || null;
@@ -199,7 +278,10 @@ export function deletePod(id: string): boolean {
 }
 
 // ---------- members ----------
-export interface PodMember { pod_id: string; person_id: string; role: string; joined_at: string; person_name?: string; person_email?: string; }
+export interface PodMember {
+  pod_id: string; person_id: string; role: string; joined_at: string;
+  allocated_hours: number | null; person_name?: string; person_email?: string;
+}
 export function listMembers(podId: string): PodMember[] {
   return db.query(
     `SELECT m.*, p.name AS person_name, p.email AS person_email FROM pod_members m JOIN people p ON p.id = m.person_id
@@ -224,6 +306,219 @@ export function addMember(podId: string, personId: string, role = ""): PodMember
 }
 export function removeMember(podId: string, personId: string): boolean {
   return db.query("DELETE FROM pod_members WHERE pod_id = ? AND person_id = ?").run(podId, personId).changes > 0;
+}
+/** Monthly hours allocated to an exec in a pod. null = auto (even split of retainer). */
+export function setMemberAllocation(podId: string, personId: string, hours: number | null): PodMember {
+  if (!isMember(podId, personId)) throw Object.assign(new Error("not a member of this pod"), { status: 404 });
+  const h = hours == null || (hours as unknown) === "" ? null : Number(hours);
+  if (h != null && (!Number.isFinite(h) || h < 0))
+    throw Object.assign(new Error("allocated_hours must be a number >= 0"), { status: 400 });
+  db.query("UPDATE pod_members SET allocated_hours = ? WHERE pod_id = ? AND person_id = ?")
+    .run(h == null ? null : Math.round(h * 100) / 100, podId, personId);
+  return listMembers(podId).find((m) => m.person_id === personId)!;
+}
+
+// ---------- conflicts of interest ----------
+export interface Conflict { id: string; person_id: string; company: string; reason: string; created_at: string; }
+export const listConflicts = (personId: string) =>
+  db.query("SELECT * FROM conflicts WHERE person_id = ? ORDER BY company COLLATE NOCASE").all(personId) as Conflict[];
+export function addConflict(personId: string, p: { company: string; reason?: string }): Conflict {
+  if (!getPerson(personId)) throw Object.assign(new Error("person not found"), { status: 404 });
+  if (!p.company?.trim()) throw Object.assign(new Error("company is required"), { status: 400 });
+  const row: Conflict = {
+    id: uid(), person_id: personId, company: p.company.trim(),
+    reason: String(p.reason || "").trim().slice(0, 300), created_at: nowIso(),
+  };
+  db.query("INSERT INTO conflicts (id, person_id, company, reason, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(row.id, row.person_id, row.company, row.reason, row.created_at);
+  return row;
+}
+export function removeConflict(id: string): boolean {
+  return db.query("DELETE FROM conflicts WHERE id = ?").run(id).changes > 0;
+}
+/** Case-insensitive company match against an exec's conflict register. */
+export function personConflictsWith(personId: string, company: string): boolean {
+  const c = (company || "").trim().toLowerCase();
+  if (!c) return false;
+  return listConflicts(personId).some((x) => x.company.toLowerCase() === c);
+}
+
+// ---------- capacity ----------
+export interface CapacityPod { pod_id: string; pod_name: string; allocated_hours: number; }
+export interface CapacityRow {
+  person_id: string; person_name: string; title: string; email: string;
+  skills: string[]; rate_tier: string; bio: string;
+  max_weekly_hours: number | null; max_monthly_hours: number | null;
+  allocated: number; load_pct: number | null; pod_count: number;
+  pods: CapacityPod[]; conflict_count: number;
+}
+const WEEKS_PER_MONTH = 4.33;
+/**
+ * Effective monthly allocation for one membership: explicit allocated_hours,
+ * else an even split of the pod's retainer cap, else 0 (hourly pods).
+ */
+export function memberAllocationHours(podId: string, personId: string): number {
+  const m = db.query("SELECT allocated_hours FROM pod_members WHERE pod_id = ? AND person_id = ?")
+    .get(podId, personId) as { allocated_hours: number | null } | null;
+  if (m && m.allocated_hours != null) return Number(m.allocated_hours);
+  const pod = getPod(podId);
+  if (pod && pod.billing_type === "retainer" && pod.retainer_hours) {
+    const n = countMembers(podId);
+    if (n > 0) return Math.round((pod.retainer_hours / n) * 100) / 100;
+  }
+  return 0;
+}
+export function capacityReport(): CapacityRow[] {
+  return listPeople().map((p) => {
+    const memberships = db.query("SELECT pod_id FROM pod_members WHERE person_id = ?").all(p.id) as { pod_id: string }[];
+    const pods: CapacityPod[] = memberships.map((m) => {
+      const pod = getPod(m.pod_id);
+      return { pod_id: m.pod_id, pod_name: pod ? pod.name : "?", allocated_hours: memberAllocationHours(m.pod_id, p.id) };
+    });
+    const allocated = Math.round(pods.reduce((a, x) => a + x.allocated_hours, 0) * 100) / 100;
+    const max_monthly_hours = p.max_weekly_hours != null ? Math.round(p.max_weekly_hours * WEEKS_PER_MONTH * 100) / 100 : null;
+    const load_pct = max_monthly_hours && max_monthly_hours > 0 ? allocated / max_monthly_hours : null;
+    const conflict_count = (db.query("SELECT COUNT(*) AS n FROM conflicts WHERE person_id = ?").get(p.id) as { n: number }).n;
+    return {
+      person_id: p.id, person_name: p.name, title: p.title, email: p.email,
+      skills: p.skills, rate_tier: p.rate_tier, bio: p.bio,
+      max_weekly_hours: p.max_weekly_hours, max_monthly_hours,
+      allocated, load_pct, pod_count: pods.length, pods, conflict_count,
+    };
+  });
+}
+
+// ---------- dynamic pod builder ----------
+export interface BuilderSuggestion {
+  person_id: string; person_name: string; title: string; skills: string[];
+  rate_tier: string; bio: string; max_weekly_hours: number | null;
+  free_hours: number | null; score: number; breakdown: string[]; reasons: string[];
+}
+/**
+ * Rank execs for a client need: +2 per matching skill, +1 when the target
+ * hours fit their free capacity. Conflict with exclude_company excludes
+ * outright. Rate tier is shown, not scored.
+ */
+export function suggestPod(p: { skills?: string[] | string; hours?: number; exclude_company?: string }): BuilderSuggestion[] {
+  const want = normalizeSkills(p.skills).map((s) => s.toLowerCase());
+  const hours = Math.max(0, Number(p.hours) || 0);
+  const exclude = (p.exclude_company || "").trim();
+  const out: BuilderSuggestion[] = [];
+  for (const c of capacityReport()) {
+    if (exclude && personConflictsWith(c.person_id, exclude)) continue;
+    let score = 0;
+    const breakdown: string[] = [];
+    const reasons: string[] = [];
+    const matched = want.filter((w) => c.skills.some((s) => s.toLowerCase() === w));
+    if (matched.length) {
+      score += 2 * matched.length;
+      breakdown.push(`+${2 * matched.length} skills`);
+      const disp = matched.map((m) => c.skills.find((s) => s.toLowerCase() === m) || m);
+      reasons.push(`matches ${disp.join(", ")}`);
+    }
+    const free = c.max_monthly_hours == null ? null : Math.round((c.max_monthly_hours - c.allocated) * 100) / 100;
+    if (hours > 0 && (free == null || free >= hours)) {
+      score += 1;
+      breakdown.push("+1 capacity");
+    }
+    if (free == null) reasons.push("unlimited capacity");
+    else reasons.push(`${free}h free of ${c.max_monthly_hours}h/mo cap`);
+    if (c.conflict_count) reasons.push(`${c.conflict_count} conflict${c.conflict_count === 1 ? "" : "s"} on file`);
+    out.push({
+      person_id: c.person_id, person_name: c.person_name, title: c.title, skills: c.skills,
+      rate_tier: c.rate_tier, bio: c.bio, max_weekly_hours: c.max_weekly_hours,
+      free_hours: free, score, breakdown, reasons,
+    });
+  }
+  out.sort((a, b) =>
+    b.score - a.score ||
+    (b.free_hours == null ? 1e9 : b.free_hours) - (a.free_hours == null ? 1e9 : a.free_hours) ||
+    a.person_name.localeCompare(b.person_name));
+  return out;
+}
+/** One-click pod creation from builder selections. */
+export function buildPod(p: { company: string; allocations: { person_id: string; allocated_hours?: number | null }[] }): { pod: Pod } {
+  const company = (p.company || "").trim();
+  if (!company) throw Object.assign(new Error("company is required"), { status: 400 });
+  if (!Array.isArray(p.allocations) || !p.allocations.length)
+    throw Object.assign(new Error("pick at least one exec"), { status: 400 });
+  const pod = createPod({ name: `${company} Pod`, client_name: company });
+  try {
+    for (const a of p.allocations) {
+      if (!a || !a.person_id) throw Object.assign(new Error("person_id is required"), { status: 400 });
+      addMember(pod.id, a.person_id, "");
+      if (a.allocated_hours != null) setMemberAllocation(pod.id, a.person_id, a.allocated_hours);
+    }
+  } catch (e) {
+    deletePod(pod.id); // don't leave a half-built pod behind
+    throw e;
+  }
+  return { pod: getPod(pod.id)! };
+}
+
+// ---------- client match portal (permissioned, anonymized) ----------
+const SLUG_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
+function randomSlugSuffix(n = 8): string {
+  let s = "";
+  for (let i = 0; i < n; i++) s += SLUG_CHARS[Math.floor(Math.random() * SLUG_CHARS.length)];
+  return s;
+}
+export function enableMatchLink(podId: string, blurb?: string): Pod {
+  const pod = getPod(podId);
+  if (!pod) throw Object.assign(new Error("pod not found"), { status: 404 });
+  let slug = pod.match_slug;
+  if (!slug) {
+    const base = pod.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "pod";
+    slug = `${base}-${randomSlugSuffix()}`;
+    let guard = 0;
+    while (db.query("SELECT 1 FROM pods WHERE match_slug = ?").get(slug) && guard++ < 20) slug = `${base}-${randomSlugSuffix()}`;
+  }
+  db.query("UPDATE pods SET match_slug = ?, match_visible = 1, match_blurb = ? WHERE id = ?")
+    .run(slug, String(blurb ?? pod.match_blurb ?? "").trim().slice(0, 500), podId);
+  return getPod(podId)!;
+}
+export function revokeMatchLink(podId: string): Pod {
+  if (!getPod(podId)) throw Object.assign(new Error("pod not found"), { status: 404 });
+  db.query("UPDATE pods SET match_slug = NULL, match_visible = 0 WHERE id = ?").run(podId);
+  return getPod(podId)!;
+}
+export function getPodByMatchSlug(slug: string): Pod | null {
+  const r = db.query("SELECT * FROM pods WHERE match_slug = ? AND match_visible = 1").get(slug) as Pod | null;
+  return r || null;
+}
+/** "Ava Reyes" → "Ava R." — never leak full names or emails. */
+export function anonymizeName(full: string): string {
+  const parts = String(full || "").trim().split(/\s+/).filter(Boolean);
+  if (!parts.length) return "—";
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]} ${parts[parts.length - 1][0]!.toUpperCase()}.`;
+}
+/** Rate tier → public band. I→$, II→$$, III→$$$. */
+export function rateBand(tier: string): string {
+  if (tier === "$" || tier === "$$" || tier === "$$$") return tier;
+  if (tier === "I") return "$";
+  if (tier === "II") return "$$";
+  if (tier === "III") return "$$$";
+  return "—";
+}
+export interface AnonMember { display_name: string; title: string; skills: string[]; rate_band: string; bio: string; }
+/** Anonymized pod roster for the public match portal. No emails, no full names, no dollar rates. */
+export function anonymizedPodMembers(podId: string): AnonMember[] {
+  return listMembers(podId).map((m) => {
+    const p = getPerson(m.person_id)!;
+    return {
+      display_name: anonymizeName(p.name),
+      title: p.title,
+      skills: p.skills,
+      rate_band: rateBand(p.rate_tier),
+      bio: p.bio,
+    };
+  });
+}
+export function matchPortalData(slug: string): { pod: { name: string; blurb: string }; members: AnonMember[] } {
+  const pod = getPodByMatchSlug(slug);
+  if (!pod) throw Object.assign(new Error("not found"), { status: 404 });
+  return { pod: { name: pod.name, blurb: pod.match_blurb || "" }, members: anonymizedPodMembers(pod.id) };
 }
 
 // ---------- channels ----------
@@ -952,8 +1247,10 @@ export function enableBookingSlug(personId: string): string {
   db.query("UPDATE people SET booking_slug = ? WHERE id = ?").run(slug, personId);
   return slug;
 }
-export const getPersonBySlug = (slug: string) =>
-  (db.query("SELECT * FROM people WHERE booking_slug = ?").get(slug) as Person) || null;
+export const getPersonBySlug = (slug: string) => {
+  const r = db.query("SELECT * FROM people WHERE booking_slug = ?").get(slug) as any;
+  return r ? personRow(r) : null;
+};
 
 export interface Booking {
   id: string; person_id: string; lead_id: string | null; start_at: string; end_at: string;

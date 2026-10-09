@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Podium — Meet your pod</title>
+<style>
+  :root {
+    --ink: #2b2620; --muted: #8a8178; --sand: #f4efe8; --paper: #faf7f2;
+    --terra: #c96f4a; --sage: #7d9b76; --gold: #b98a2f;
+    --glass: rgba(255,255,255,0.72); --glass-border: rgba(43,38,32,0.08);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: var(--ink); background: var(--paper);
+    background-image: radial-gradient(1200px 500px at 50% -10%, #f7f1e6 0%, var(--paper) 60%);
+    min-height: 100vh; padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; }
+  .brand { font-weight: 800; font-size: 22px; letter-spacing: -0.5px; margin-bottom: 4px; }
+  .brand span { color: var(--terra); }
+  .card {
+    background: var(--glass); -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+    border: 1px solid var(--glass-border); border-radius: 18px;
+    box-shadow: 0 8px 28px rgba(43,38,32,0.07); padding: 20px; margin-top: 16px;
+  }
+  h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.5px; }
+  .sub { color: var(--muted); font-size: 14px; line-height: 1.55; }
+  .blurb { font-size: 15px; line-height: 1.6; margin-top: 12px; }
+  .member { display: flex; gap: 14px; align-items: flex-start; }
+  .avatar {
+    width: 46px; height: 46px; border-radius: 50%; flex-shrink: 0;
+    background: linear-gradient(135deg, var(--terra), var(--gold));
+    color: #fff; font-weight: 700; font-size: 16px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .nm { font-weight: 700; font-size: 16px; }
+  .ti { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .tag {
+    font-size: 12px; font-weight: 600; background: var(--sand); color: var(--ink);
+    border-radius: 999px; padding: 4px 10px;
+  }
+  .band {
+    font-size: 12px; font-weight: 700; color: var(--gold);
+    border: 1px solid rgba(185,138,47,0.4); border-radius: 999px; padding: 4px 10px;
+  }
+  .bio { font-size: 14px; line-height: 1.55; color: #4a443c; margin-top: 10px; }
+  .foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 28px; }
+  .err-card { text-align: center; padding: 36px 20px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="brand">Podium<span>.</span></div>
+  <div id="content"><div class="card"><div class="sub">Loading…</div></div></div>
+  <div class="foot">Profiles are anonymized. Your firm shares full details when you're ready.</div>
+</div>
+<script>
+(function () {
+  var slug = location.pathname.split("/").filter(Boolean)[1] || "";
+  var content = document.getElementById("content");
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  fetch("/api/match/" + encodeURIComponent(slug)).then(function (r) {
+    if (!r.ok) throw new Error("not found");
+    return r.json();
+  }).then(function (d) {
+    var h = '<div class="card"><div class="sub">Meet your pod</div><h1>' + esc(d.pod.name) + '</h1>' +
+      (d.pod.blurb ? '<div class="blurb">' + esc(d.pod.blurb) + '</div>' : "") + '</div>';
+    h += d.members.map(function (m) {
+      var initials = m.display_name.split(/\s+/).map(function (w) { return w[0]; }).join("").slice(0, 2).toUpperCase();
+      var tags = (m.skills || []).map(function (s) { return '<span class="tag">' + esc(s) + '</span>'; }).join("");
+      return '<div class="card"><div class="member"><div class="avatar">' + esc(initials) + '</div>' +
+        '<div><div class="nm">' + esc(m.display_name) + '</div>' +
+        '<div class="ti">' + esc(m.title || "Executive") + '</div>' +
+        '<div class="tags">' + tags + (m.rate_band ? '<span class="band">' + esc(m.rate_band) + '</span>' : "") + '</div>' +
+        (m.bio ? '<div class="bio">' + esc(m.bio) + '</div>' : "") +
+        '</div></div></div>';
+    }).join("");
+    content.innerHTML = h;
+  }).catch(function () {
+    content.innerHTML = '<div class="card err-card"><h1>Link unavailable</h1>' +
+      '<div class="sub">This match link is invalid or has been revoked. Ask your firm for a fresh one.</div></div>';
+  });
+})();
+</script>
+</body>
+</html>

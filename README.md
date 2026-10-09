@@ -30,6 +30,9 @@ bun src/server.ts
 - **QuickBooks Online** — OAuth connect, push invoices (customer find-or-create). Until connected, the CSV export is the bridge.
 - **ClickUp** — link a ClickUp list per pod; the pod's Tasks tab lists tasks (status, due, assignees, deep link), creates tasks, and closes them (resolves the list's done/closed status first). Token verified in Settings.
 - **Mailbox (IMAP)** — each pod's Inbox tab shows the latest email thread with every member, read-only (never marks mail seen), cached 5 minutes with manual refresh. Uses the same zero-dep IMAP client as Relay (`src/imap.ts`, copied verbatim).
+- **Talent** — exec skill matrix + capacity dashboard: per-exec monthly cap (max weekly hours × 4.33), allocated hours across pods, load bars (green <70%, amber 70–95%, red >95%), skill filter, conflict-of-interest badges. People carry skills, rate tier (I/II/III or $/$$/$$$), and an optional bio.
+- **Pod builder** — enter a client company, required skills, and target monthly hours; execs are ranked (+2 per matching skill, +1 when the hours fit their free capacity; conflicted execs are excluded outright). One-click "Create pod" spins up `<Company> Pod` with per-exec monthly allocations.
+- **Client match portal** — per-pod public link (`/match/:slug`, anonymized: first name + last initial, title, skill tags, rate band, bio — no emails, full names, or dollar rates). Enable/revoke from the pod view; revoked or invisible slugs 404.
 
 ### Payroll scope — a judgment call
 
@@ -46,6 +49,14 @@ Podium does **calculation + statements + CSV export**. No money moves through Po
 - **No inbound Slack mirroring** in v1 — outbound notifications + channel provisioning only.
 - **No background IMAP polling** in v1 — the Inbox tab fetches on open + manual refresh; the 5-minute cache keeps it from hammering the mail server.
 - **No ClickUp webhooks** in v1 — tasks refresh on tab open.
+
+### Talent judgment calls
+
+- **Allocation rule**: explicit `allocated_hours` per membership wins; otherwise an even split of the pod's retainer cap; hourly pods contribute 0 unless set explicitly. Capacity is computed on request — no background jobs.
+- **Conflict exclusion, not penalty**: an exec conflicted with the client company is dropped from builder suggestions outright (cleaner than a −10 score).
+- **Rate tier is shown, never scored** — the builder ranks on skills + capacity fit only.
+- **Match portal anonymization is enforced server-side** (`matchPortalData` builds fresh objects — no email/full-name fields exist to leak), and the public `/match/:slug` page 404s on revoked/invisible slugs.
+- **The client-need blurb** (`match_blurb`) is firm-written marketing copy shown on the match page — editable when the link is enabled.
 
 ## API
 
@@ -98,13 +109,14 @@ REST JSON under `/api/*`:
 ## Tests
 
 ```sh
-bun test                          # api.test.ts + ui.test.ts (existing suite)
-bun test ./tests/integrations-check.ts   # v1 integrations (36 tests)
+bun test                          # full suite
 ```
 
 Covers: 9-member cap, time-entry validation, payroll math across pods, close locks entries (403), statement snapshots, CSV shape, single-open-period rule — plus a DOM-stubbed render smoke test of the main views.
 
 Integrations: lead stage machine, spin-up-pod money loop, Top-20 ordering, template substitution, timer rounding (0.1h), retainer usage, booking slots/double-book/availability, invoice math (hourly + flat retainer) and numbering, Stripe send/sync/webhook with mocked fetch, Slack provision/invites with mocked fetch, QBO push payload with mocked fetch, settings secret masking — plus render smoke tests of every new view.
+
+Talent (`tests/talent-check.test.ts`, 21 tests): person skill/tier/bio fields + validation, conflicts CRUD, capacity math (explicit hours, retainer even-split fallback, hourly = 0, unlimited cap), builder scoring (+2/skill, +1 capacity fit), conflict exclusion, builder pod creation (naming, members, hours, validation), match portal (enable/revoke, anonymization of HTML + JSON — no email/full-name leaks, 404s for bogus and revoked slugs), and DOM-stubbed renders of the Talent/Builder/match-portal views.
 
 ## Seed data
 

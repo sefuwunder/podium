@@ -95,6 +95,7 @@ var state = {
   timePerson: null, timeWeek: mondayOf(), entries: [],
   periods: [], period: null,
   tasks: [], tasksErr: "", inbox: null, inboxLoading: false,
+  talent: [], talentFilter: "", talentSort: "load", builder: null, conflictsPanel: null,
   err: "", okMsg: "",
 };
 function setErr(m) { state.err = m; state.okMsg = ""; render(); if (!reducedMotion && typeof document !== "undefined") window.scrollTo(0, 0); }
@@ -111,6 +112,7 @@ function route() {
   if (v === "pods") return loadPods();
   if (v === "pod" && parts[1]) return loadPod(parts[1], parts[2] || "channels");
   if (v === "people") return loadPeople();
+  if (v === "talent") return parts[1] === "builder" ? loadBuilder() : loadTalent();
   if (v === "payroll") return loadPayroll(parts[1] || null);
   if (v === "pipeline") return parts[1] === "top20" ? loadTop20() : loadPipeline();
   if (v === "lead" && parts[1]) return loadLead(parts[1]);
@@ -172,15 +174,38 @@ function loadTimeTab() {
 }
 function loadPeople() {
   var week = mondayOf();
-  Promise.all([api("GET", "/api/people"), api("GET", "/api/dashboard"), api("GET", "/api/time?week=" + week)])
+  Promise.all([api("GET", "/api/people"), api("GET", "/api/dashboard"), api("GET", "/api/time?week=" + week), api("GET", "/api/capacity")])
     .then(function (r) {
       state.people = r[0].people; state.dash = r[1];
       var wh = {};
       r[2].entries.forEach(function (e) { wh[e.person_id] = (wh[e.person_id] || 0) + Number(e.hours); });
       state.weekHours = wh;
+      var cc = {};
+      (r[3].capacity || []).forEach(function (c) { cc[c.person_id] = c.conflict_count; });
+      state.conflictCounts = cc;
       render();
     })
     .catch(function (e) { setErr(e.message); });
+}
+/* ---------- talent & pod builder ---------- */
+function loadTalent() {
+  api("GET", "/api/capacity").then(function (r) {
+    state.talent = r.capacity; render();
+  }).catch(function (e) { setErr(e.message); });
+}
+function freshBuilder() {
+  return { company: "", skills: "", hours: 20, budget: "", suggestions: null, picked: {}, hoursEach: "", allSkills: [] };
+}
+function loadBuilder() {
+  if (!state.builder) state.builder = freshBuilder();
+  api("GET", "/api/capacity").then(function (r) {
+    var seen = {}, skills = [];
+    r.capacity.forEach(function (c) {
+      (c.skills || []).forEach(function (s) { if (!seen[s.toLowerCase()]) { seen[s.toLowerCase()] = 1; skills.push(s); } });
+    });
+    state.builder.allSkills = skills.sort();
+    render();
+  }).catch(function (e) { setErr(e.message); });
 }
 function loadPayroll(periodId) {
   api("GET", "/api/periods").then(function (r) {
@@ -257,6 +282,7 @@ function renderSidebar() {
     '<div class="nav-sec">Firm</div>' +
     '<a class="nav-item" href="#/home">Dashboard</a>' +
     '<a class="nav-item" href="#/pipeline">Pipeline</a>' +
+    '<a class="nav-item" href="#/talent">Talent</a>' +
     '<a class="nav-item" href="#/schedule">Schedule</a>' +
     '<a class="nav-item" href="#/invoices">Invoices</a>' +
     '<a class="nav-item" href="#/people">People</a>' +
@@ -334,6 +360,16 @@ function viewPodHead(pod, tab, members, retainer, timers) {
     return '<span class="pill" style="background:var(--sand);margin:2px 4px 2px 0" title="' + esc(m.role || "member") + '">' +
       esc(m.person_name) + ' <a href="#" onclick="return Podium.removeMember(\'' + pod.id + "','" + m.person_id + '\')" style="color:var(--muted);text-decoration:none" title="Remove">×</a></span>';
   }).join("");
+  var allocRows = members.map(function (m) {
+    return '<tr><td>' + esc(m.person_name) + '</td>' +
+      '<td class="num"><input type="number" min="0" step="0.5" class="hours-input" style="max-width:90px" placeholder="auto" ' +
+      'value="' + (m.allocated_hours == null ? "" : m.allocated_hours) + '" ' +
+      'onchange="Podium.setAllocation(\'' + pod.id + "','" + m.person_id + '\', this.value)" title="Monthly hours — blank splits the retainer evenly"></td></tr>';
+  }).join("");
+  var allocTable = members.length
+    ? '<table class="alloc-table" style="margin-top:10px"><tr><th>Exec</th><th class="num">Hours / month</th></tr>' + allocRows + '</table>' +
+      '<div class="muted small">Blank = even split of the retainer cap. Hourly pods count 0 unless set.</div>'
+    : "";
   var billing = (pod.billing_type === "retainer")
     ? '<span class="pill billable">retainer' + (pod.retainer_hours ? ' · ' + fmtHours(pod.retainer_hours) + '/mo' : '') + '</span>'
     : '<span class="pill nonbill">hourly</span>';
@@ -341,11 +377,12 @@ function viewPodHead(pod, tab, members, retainer, timers) {
     '<h1>' + esc(pod.name) + '</h1><span class="sub">' + esc(pod.client_name || "") + ' · ' + members.length + '/9 members</span> ' + billing +
     '<span style="flex:1"></span><button class="link-btn" onclick="Podium.editBilling(\'' + pod.id + '\')">Billing</button></div>' + flash() +
     viewRetainerBar(retainer) + viewTimerWidget(pod, members, timers) +
-    '<div class="card"><h3>Members</h3><div>' + (mem || '<span class="muted">No members yet — add the pod\'s execs below.</span>') + '</div>' +
+    '<div class="card"><h3>Members</h3><div>' + (mem || '<span class="muted">No members yet — add the pod\'s execs below.</span>') + '</div>' + allocTable +
     '<form onsubmit="return Podium.addMember(event,\'' + pod.id + '\')" style="margin-top:10px"><div class="form-row">' +
     '<select name="person_id" id="member-picker" required></select>' +
     '<input name="role" placeholder="Role in pod (e.g. Lead)" maxlength="40">' +
     '</div><div style="margin-top:10px"><button class="btn small" type="submit">Add member</button></div></form></div>' +
+    viewMatchPortal(pod) +
     '<div class="tabs">' + tabs + '</div>';
 }
 
@@ -472,15 +509,25 @@ function viewTimeTab(pod, members, people, personId, week, entries) {
 
 function viewPeople(people, weekHours) {
   weekHours = weekHours || {};
+  var cc = state.conflictCounts || {};
   var rows = people.map(function (p) {
     var initials = p.name.split(/\s+/).map(function (w) { return w[0]; }).join("").slice(0, 2).toUpperCase();
+    var cbadge = cc[p.id]
+      ? '<button class="conflict-badge" onclick="Podium.showConflicts(\'' + p.id + '\')">⚠ ' + cc[p.id] + '</button> ' : "";
+    var tags = (p.skills || []).slice(0, 4).map(function (s) { return '<span class="skill-tag">' + esc(s) + '</span>'; }).join("");
     return '<div class="person-row"><div class="avatar">' + esc(initials) + '</div>' +
-      '<div class="who"><div class="nm">' + esc(p.name) + '</div><div class="ti">' + esc(p.title || "—") + (p.email ? " · " + esc(p.email) : "") + '</div></div>' +
-      '<div style="text-align:right"><div class="rate">' + money(p.hourly_rate_cents) + '/hr</div>' +
+      '<div class="who"><div class="nm">' + esc(p.name) + '</div><div class="ti">' + esc(p.title || "—") + (p.email ? " · " + esc(p.email) : "") + '</div>' +
+      (tags ? '<div class="tags">' + tags + '</div>' : "") + '</div>' +
+      '<div style="text-align:right"><div class="rate">' + money(p.hourly_rate_cents) + '/hr' +
+      (p.rate_tier ? ' <span class="pill tier">' + esc(p.rate_tier) + '</span>' : "") + '</div>' +
       '<div class="muted">' + fmtHours(weekHours[p.id] || 0) + ' this week</div></div>' +
-      '<button class="link-btn" onclick="Podium.editPerson(\'' + p.id + '\')">Edit</button></div>';
+      '<div class="person-actions">' + cbadge +
+      '<button class="link-btn" onclick="Podium.showConflicts(\'' + p.id + '\')">Conflicts</button>' +
+      '<button class="link-btn" onclick="Podium.editPerson(\'' + p.id + '\')">Edit</button></div></div>';
   }).join("");
-  return '<div class="view-head"><h1>People</h1><span class="sub">' + people.length + ' execs</span></div>' + flash() +
+  return '<div class="view-head"><h1>People</h1><span class="sub">' + people.length + ' execs</span><span style="flex:1"></span>' +
+    '<a class="link-btn" href="#/talent">Talent & capacity →</a></div>' + flash() +
+    viewConflictsPanel(state.conflictsPanel) +
     '<div class="card">' + (rows || '<div class="empty">No people yet.</div>') + '</div>' +
     '<div class="card"><h3>Add person</h3><form onsubmit="return Podium.savePerson(event)">' +
     '<input type="hidden" name="id" id="person-id"><div class="form-row">' +
@@ -488,7 +535,165 @@ function viewPeople(people, weekHours) {
     '<div><label>Title</label><input name="title" id="person-title" placeholder="Fractional CFO" maxlength="60"></div></div>' +
     '<div class="form-row"><div><label>Email</label><input name="email" id="person-email" type="email" maxlength="120"></div>' +
     '<div><label>Hourly rate (USD)</label><input name="rate" id="person-rate" type="number" min="0" step="1" placeholder="250"></div></div>' +
+    '<div class="form-row"><div><label>Max hours / week (blank = unlimited)</label><input name="maxh" id="person-maxh" type="number" min="0" step="0.5" placeholder="20"></div>' +
+    '<div><label>Rate tier</label><select name="tier" id="person-tier"><option value="">—</option>' +
+    ["I", "II", "III", "$", "$$", "$$$"].map(function (t) { return '<option value="' + t + '">' + t + '</option>'; }).join("") +
+    '</select></div></div>' +
+    '<div style="margin-top:8px"><label>Skills (comma-separated)</label><input name="skills" id="person-skills" placeholder="fintech, turnaround, fundraising" maxlength="300"></div>' +
+    '<div style="margin-top:8px"><label>Bio (shown on the client match page)</label><textarea name="bio" id="person-bio" rows="2" maxlength="600" placeholder="Two lines on background and edge."></textarea></div>' +
     '<div style="margin-top:10px"><button class="btn" type="submit">Save person</button> <button class="btn ghost" type="button" onclick="Podium.resetPersonForm()">Clear</button></div></form></div>';
+}
+
+/* ---------- talent & pod builder ---------- */
+function talentLoadClass(pct) {
+  if (pct == null) return "load-none";
+  if (pct < 0.7) return "load-ok";
+  if (pct <= 0.95) return "load-warn";
+  return "load-over";
+}
+function viewTalent(cap, filter, sort) {
+  filter = (filter || "").toLowerCase();
+  sort = sort || "load";
+  var list = cap.filter(function (c) {
+    if (!filter) return true;
+    var hay = (c.person_name + " " + (c.title || "") + " " + (c.skills || []).join(" ")).toLowerCase();
+    return hay.indexOf(filter) >= 0;
+  }).slice();
+  if (sort === "name") list.sort(function (a, b) { return a.person_name.localeCompare(b.person_name); });
+  else if (sort === "free") list.sort(function (a, b) {
+    var fa = a.max_monthly_hours == null ? 1e12 : a.max_monthly_hours - a.allocated;
+    var fb = b.max_monthly_hours == null ? 1e12 : b.max_monthly_hours - b.allocated;
+    return fb - fa;
+  });
+  else list.sort(function (a, b) { return (b.load_pct == null ? -1 : b.load_pct) - (a.load_pct == null ? -1 : a.load_pct); });
+  var rows = list.map(function (c) {
+    var initials = c.person_name.split(/\s+/).map(function (w) { return w[0]; }).join("").slice(0, 2).toUpperCase();
+    var loadHtml;
+    if (c.max_monthly_hours == null) {
+      loadHtml = '<div class="bar-row"><div class="bar-track"><div class="bar-fill load-none" style="width:100%"></div></div></div>' +
+        '<div class="muted small">' + fmtHours(c.allocated) + ' allocated · no cap set</div>';
+    } else {
+      var pct = Math.min(1, c.load_pct || 0);
+      loadHtml = '<div class="bar-row"><div class="bar-track"><div class="bar-fill ' + talentLoadClass(c.load_pct) +
+        '" style="width:' + Math.round(pct * 100) + '%"></div></div>' +
+        '<div class="load-num ' + talentLoadClass(c.load_pct) + '">' + Math.round((c.load_pct || 0) * 100) + '%</div></div>' +
+        '<div class="muted small">' + fmtHours(c.allocated) + ' / ' + fmtHours(c.max_monthly_hours) + ' per month · ' +
+        c.pod_count + ' pod' + (c.pod_count === 1 ? "" : "s") + '</div>';
+    }
+    var tags = (c.skills || []).map(function (s) { return '<span class="skill-tag">' + esc(s) + '</span>'; }).join("");
+    var tier = c.rate_tier ? '<span class="pill tier">' + esc(c.rate_tier) + '</span>' : "";
+    var cbadge = c.conflict_count
+      ? '<button class="conflict-badge" onclick="Podium.showConflicts(\'' + c.person_id + '\')" title="Manage conflicts">⚠ ' +
+        c.conflict_count + ' conflict' + (c.conflict_count === 1 ? "" : "s") + '</button>' : "";
+    return '<div class="card talent-card"><div class="talent-top"><div class="avatar">' + esc(initials) + '</div>' +
+      '<div class="who"><div class="nm">' + esc(c.person_name) + '</div>' +
+      '<div class="ti">' + esc(c.title || "—") + '</div></div>' +
+      '<div class="talent-meta">' + tier + cbadge + '</div></div>' +
+      '<div class="talent-bar">' + loadHtml + '</div>' +
+      (tags ? '<div class="tags">' + tags + '</div>' : '<div class="muted small">No skills tagged yet</div>') + '</div>';
+  }).join("");
+  return '<div class="view-head"><h1>Talent</h1><span class="sub">' + cap.length + ' execs</span><span style="flex:1"></span>' +
+    '<a class="btn small" href="#/talent/builder">Pod builder</a></div>' + flash() +
+    '<div class="card"><div class="form-row"><div><label>Filter by skill, name, or title</label>' +
+    '<input id="talent-filter" placeholder="e.g. fintech" value="' + esc(state.talentFilter || "") +
+    '" oninput="Podium.setTalentFilter(this.value)"></div>' +
+    '<div><label>Sort</label><select id="talent-sort" onchange="Podium.setTalentSort(this.value)">' +
+    '<option value="load"' + (sort === "load" ? " selected" : "") + '>Busiest first</option>' +
+    '<option value="free"' + (sort === "free" ? " selected" : "") + '>Most free capacity</option>' +
+    '<option value="name"' + (sort === "name" ? " selected" : "") + '>Name A–Z</option>' +
+    '</select></div></div></div>' +
+    (rows || '<div class="card"><div class="empty">No execs match that filter.</div></div>');
+}
+function viewBuilder(b) {
+  var chips = (b.allSkills || []).map(function (s) {
+    var on = ("," + (b.skills || "") + ",").toLowerCase().indexOf("," + s.toLowerCase() + ",") >= 0;
+    return '<button type="button" class="skill-chip' + (on ? " on" : "") + '" onclick="Podium.toggleBuilderSkill(this)" data-skill="' +
+      esc(s) + '">' + esc(s) + '</button>';
+  }).join("");
+  var tiers = ["", "I", "II", "III", "$", "$$", "$$$"].map(function (t) {
+    return '<option value="' + t + '"' + (b.budget === t ? " selected" : "") + '>' + (t || "No preference") + '</option>';
+  }).join("");
+  var results;
+  if (!b.suggestions) {
+    results = '<div class="card"><div class="empty">Run a search to rank the firm\'s execs against the client need.</div></div>';
+  } else if (!b.suggestions.length) {
+    results = '<div class="card"><div class="empty">No execs available — try fewer skills or a different company.</div></div>';
+  } else {
+    var picked = Object.keys(b.picked || {}).filter(function (k) { return b.picked[k]; });
+    var each = b.hoursEach !== "" && b.hoursEach != null
+      ? Number(b.hoursEach)
+      : (picked.length ? Math.round(b.hours / picked.length * 10) / 10 : b.hours);
+    results = b.suggestions.map(function (s) {
+      var isOn = !!b.picked[s.person_id];
+      var tags = (s.skills || []).map(function (t) { return '<span class="skill-tag">' + esc(t) + '</span>'; }).join("");
+      var reasons = s.reasons.map(function (r) { return '<li>' + esc(r) + '</li>'; }).join("");
+      return '<label class="card builder-pick' + (isOn ? " on" : "") + '">' +
+        '<input type="checkbox"' + (isOn ? " checked" : "") + ' onchange="Podium.toggleBuilderPick(\'' + s.person_id + '\')">' +
+        '<div class="builder-body"><div class="builder-top"><b>' + esc(s.person_name) + '</b> ' +
+        '<span class="score-pill">' + s.score + ' pts</span>' +
+        (s.rate_tier ? '<span class="pill tier">' + esc(s.rate_tier) + '</span>' : "") + '</div>' +
+        '<div class="muted small">' + esc(s.title || "—") + (s.free_hours == null
+          ? " · unlimited capacity" : " · " + fmtHours(s.free_hours) + " free") + '</div>' +
+        '<div class="tags">' + tags + '</div>' +
+        '<ul class="reasons">' + reasons + '</ul>' +
+        '<div class="muted small">' + s.breakdown.map(esc).join(" · ") + '</div></div></label>';
+    }).join("");
+    results += '<div class="card builder-cta"><div class="form-row"><div><label>Hours each / month</label>' +
+      '<input type="number" min="0" step="0.5" value="' + (b.hoursEach === "" ? each : esc(b.hoursEach)) +
+      '" oninput="Podium.builderField(\'hoursEach\', this.value)"></div>' +
+      '<div style="align-self:end"><button class="btn" ' + (picked.length ? "" : "disabled") +
+      ' onclick="Podium.createBuiltPod()">Create pod' + (picked.length ? " (" + picked.length + ")" : "") + '</button></div></div>' +
+      '<div class="muted small">Creates "' + esc(b.company || "…") + ' Pod" with ' + picked.length + ' exec' +
+      (picked.length === 1 ? "" : "s") + ' at ' + fmtHours(each) + '/month each.</div></div>';
+  }
+  return '<div class="view-head"><h1>Pod builder</h1><span class="sub">Match execs to a client need</span>' +
+    '<span style="flex:1"></span><a class="link-btn" href="#/talent">← Talent</a></div>' + flash() +
+    '<div class="card"><h3>Client need</h3>' +
+    '<div class="form-row"><div><label>Client company</label>' +
+    '<input value="' + esc(b.company) + '" placeholder="Acme Foods" oninput="Podium.builderField(\'company\', this.value)"></div>' +
+    '<div><label>Target hours / month</label>' +
+    '<input type="number" min="0" step="1" value="' + esc(b.hours) + '" oninput="Podium.builderField(\'hours\', this.value)"></div></div>' +
+    '<div class="form-row"><div><label>Required skills (comma-separated)</label>' +
+    '<input value="' + esc(b.skills) + '" placeholder="fintech, turnaround" oninput="Podium.builderField(\'skills\', this.value)"></div>' +
+    '<div><label>Budget tier (display only)</label><select onchange="Podium.builderField(\'budget\', this.value)">' + tiers + '</select></div></div>' +
+    (chips ? '<div class="tags" style="margin-top:8px">' + chips + '</div>' : "") +
+    '<div style="margin-top:12px"><button class="btn" onclick="Podium.runBuilderSuggest()">Find matches</button></div></div>' +
+    results;
+}
+/* conflicts panel (lives on the People view) */
+function viewConflictsPanel(panel) {
+  if (!panel) return "";
+  var rows = panel.list.map(function (c) {
+    return '<div class="page-item"><div class="t">' + esc(c.company) + '</div>' +
+      (c.reason ? '<div class="muted small">' + esc(c.reason) + '</div>' : "") +
+      '<button class="link-btn" onclick="Podium.removeConflict(\'' + panel.person.id + "','" + c.id + '\')">Remove</button></div>';
+  }).join("");
+  return '<div class="card"><div class="view-head"><h3 style="margin:0">Conflicts — ' + esc(panel.person.name) +
+    '</h3><span style="flex:1"></span><button class="link-btn" onclick="Podium.closeConflicts()">Close</button></div>' +
+    (rows || '<div class="muted">None on file.</div>') +
+    '<form onsubmit="return Podium.addConflict(event,\'' + panel.person.id + '\')" style="margin-top:10px"><div class="form-row">' +
+    '<div><label>Company</label><input name="company" required maxlength="80" placeholder="Rival Inc"></div>' +
+    '<div><label>Reason (optional)</label><input name="reason" maxlength="300" placeholder="Board seat"></div>' +
+    '</div><div style="margin-top:10px"><button class="btn small" type="submit">Add conflict</button></div></form></div>';
+}
+/* client match portal card (lives on the pod view) */
+function viewMatchPortal(pod) {
+  var h = '<div class="card"><h3>Client match portal</h3>';
+  if (pod.match_visible && pod.match_slug) {
+    var url = (typeof location !== "undefined" ? location.origin : "") + "/match/" + pod.match_slug;
+    h += '<div class="muted small">Live — clients see anonymized profiles (no full names, emails, or dollar rates).</div>' +
+      '<div class="form-row" style="margin-top:8px"><input id="match-url" readonly value="' + esc(url) + '" onclick="this.select()"></div>' +
+      '<div style="margin-top:8px"><button class="btn small" onclick="Podium.copyMatchLink()">Copy link</button> ' +
+      '<button class="btn small ghost" onclick="Podium.revokeMatchLink(\'' + pod.id + '\')">Revoke</button></div>';
+  } else {
+    h += '<div class="muted small">Generate a public link so the client can meet this pod — anonymized profiles only.</div>';
+  }
+  h += '<div style="margin-top:10px"><label>Client-need summary (shown on the page)</label>' +
+    '<textarea id="match-blurb" maxlength="500" rows="2" placeholder="e.g. Series A fintech — needs CFO + COO, ~30h/mo">' +
+    esc(pod.match_blurb || "") + '</textarea></div>' +
+    '<div style="margin-top:8px"><button class="btn small" onclick="Podium.enableMatchLink(\'' + pod.id + '\')">' +
+    (pod.match_visible ? "Update summary" : "Enable match link") + '</button></div></div>';
+  return h;
 }
 
 function viewPayroll(periods, detail) {
@@ -916,6 +1121,7 @@ function render() {
     fillMemberPicker();
   }
   else if (v === "people") el.innerHTML = viewPeople(state.people, state.weekHours || {});
+  else if (v === "talent") el.innerHTML = parts[1] === "builder" ? viewBuilder(state.builder || freshBuilder()) : viewTalent(state.talent || [], state.talentFilter, state.talentSort);
   else if (v === "payroll") el.innerHTML = viewPayroll(state.periods, state.period);
   else if (v === "pipeline") el.innerHTML = parts[1] === "top20" ? viewTop20(state.top20) : viewPipeline(state.pipeline);
   else if (v === "lead" && state.lead) el.innerHTML = viewLead(state.lead, state.partners, state.leadBookings);
@@ -969,6 +1175,8 @@ var Podium = {
   viewSchedule: viewSchedule, viewInvoices: viewInvoices, viewSettings: viewSettings,
   viewRetainerBar: viewRetainerBar, viewTimerWidget: viewTimerWidget, fmtMin: fmtMin, tempDot: tempDot,
   viewTasks: viewTasks, viewInbox: viewInbox, labelTables: labelTables, timeAgo: timeAgo,
+  viewTalent: viewTalent, viewBuilder: viewBuilder, viewMatchPortal: viewMatchPortal,
+  freshBuilder: freshBuilder, talentLoadClass: talentLoadClass,
 
   createPod: function (e) {
     e.preventDefault();
@@ -1092,7 +1300,12 @@ var Podium = {
   savePerson: function (e) {
     e.preventDefault();
     var f = e.target, id = f.id.value;
-    var body = { name: f.name.value, title: f.title.value, email: f.email.value, hourly_rate_cents: Math.round(Number(f.rate.value || 0) * 100) };
+    var body = {
+      name: f.name.value, title: f.title.value, email: f.email.value,
+      hourly_rate_cents: Math.round(Number(f.rate.value || 0) * 100),
+      max_weekly_hours: f.maxh.value === "" ? null : Number(f.maxh.value),
+      skills: f.skills.value, rate_tier: f.tier.value, bio: f.bio.value,
+    };
     var p = id ? api("PUT", "/api/people/" + id, body) : api("POST", "/api/people", body);
     p.then(function () { Podium.resetPersonForm(); loadPeople(); setOk("Saved."); }).catch(function (er) { setErr(er.message); });
     return false;
@@ -1105,10 +1318,117 @@ var Podium = {
     document.getElementById("person-title").value = pe.title || "";
     document.getElementById("person-email").value = pe.email || "";
     document.getElementById("person-rate").value = (pe.hourly_rate_cents / 100).toString();
+    document.getElementById("person-maxh").value = pe.max_weekly_hours == null ? "" : pe.max_weekly_hours;
+    document.getElementById("person-tier").value = pe.rate_tier || "";
+    document.getElementById("person-skills").value = (pe.skills || []).join(", ");
+    document.getElementById("person-bio").value = pe.bio || "";
     document.getElementById("person-name").scrollIntoView({ block: "center" });
   },
   resetPersonForm: function () {
-    ["person-id", "person-name", "person-title", "person-email", "person-rate"].forEach(function (i) { document.getElementById(i).value = ""; });
+    ["person-id", "person-name", "person-title", "person-email", "person-rate", "person-maxh", "person-tier", "person-skills", "person-bio"]
+      .forEach(function (i) { var el = document.getElementById(i); if (el) el.value = ""; });
+  },
+
+  /* ----- talent ----- */
+  setTalentFilter: function (v) { state.talentFilter = v; render(); var el = document.getElementById("talent-filter"); if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } },
+  setTalentSort: function (v) { state.talentSort = v; render(); },
+  builderField: function (k, v) { if (!state.builder) state.builder = freshBuilder(); state.builder[k] = v; },
+  toggleBuilderSkill: function (btn) {
+    var s = btn.getAttribute("data-skill") || "";
+    if (!state.builder) state.builder = freshBuilder();
+    var cur = ("," + (state.builder.skills || "") + ",").toLowerCase();
+    var key = "," + s.toLowerCase() + ",";
+    var parts = (state.builder.skills || "").split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+    if (cur.indexOf(key) >= 0) parts = parts.filter(function (x) { return x.toLowerCase() !== s.toLowerCase(); });
+    else parts.push(s);
+    state.builder.skills = parts.join(", ");
+    render();
+  },
+  runBuilderSuggest: function () {
+    if (!state.builder) state.builder = freshBuilder();
+    var b = state.builder;
+    if (!b.company.trim()) { setErr("Enter the client company first."); return; }
+    api("POST", "/api/pod-builder/suggest", { skills: b.skills, hours: Number(b.hours) || 0, exclude_company: b.company })
+      .then(function (r) { b.suggestions = r.suggestions; render(); setOk(b.suggestions.length + " execs ranked."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  toggleBuilderPick: function (id) {
+    if (!state.builder) return;
+    state.builder.picked[id] = !state.builder.picked[id];
+    render();
+  },
+  createBuiltPod: function () {
+    var b = state.builder;
+    if (!b || !b.company.trim()) { setErr("Enter the client company first."); return; }
+    var picked = Object.keys(b.picked).filter(function (k) { return b.picked[k]; });
+    if (!picked.length) { setErr("Pick at least one exec."); return; }
+    var each = b.hoursEach !== "" && b.hoursEach != null
+      ? Number(b.hoursEach)
+      : Math.round((Number(b.hours) || 0) / picked.length * 10) / 10;
+    api("POST", "/api/pod-builder/create", {
+      company: b.company.trim(),
+      allocations: picked.map(function (id) { return { person_id: id, allocated_hours: each }; }),
+    }).then(function (r) {
+      state.builder = freshBuilder();
+      location.hash = "#/pod/" + r.pod.id + "/channels";
+      setOk("Pod created.");
+    }).catch(function (er) { setErr(er.message); });
+  },
+
+  /* ----- conflicts ----- */
+  showConflicts: function (personId) {
+    var pe = (state.people || []).find(function (x) { return x.id === personId; }) ||
+      (state.talent || []).find(function (x) { return x.person_id === personId; });
+    var person = pe ? { id: pe.id || pe.person_id, name: pe.name || pe.person_name } : { id: personId, name: "Exec" };
+    api("GET", "/api/people/" + personId + "/conflicts").then(function (r) {
+      state.conflictsPanel = { person: person, list: r.conflicts };
+      if (currentView() !== "people") location.hash = "#/people";
+      else render();
+    }).catch(function (er) { setErr(er.message); });
+  },
+  closeConflicts: function () { state.conflictsPanel = null; render(); },
+  addConflict: function (e, personId) {
+    e.preventDefault();
+    var f = e.target;
+    api("POST", "/api/people/" + personId + "/conflicts", { company: f.company.value, reason: f.reason.value })
+      .then(function () { f.reset(); Podium.showConflicts(personId); setOk("Conflict recorded."); })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  removeConflict: function (personId, cid) {
+    if (!confirm("Remove this conflict?")) return;
+    api("DELETE", "/api/people/" + personId + "/conflicts/" + cid)
+      .then(function () { Podium.showConflicts(personId); })
+      .catch(function (er) { setErr(er.message); });
+  },
+
+  /* ----- allocations ----- */
+  setAllocation: function (podId, personId, v) {
+    var hours = v === "" ? null : Number(v);
+    api("PUT", "/api/pods/" + podId + "/members/" + personId, { allocated_hours: hours })
+      .then(function () { loadPod(podId, state.podTab || "channels"); })
+      .catch(function (er) { setErr(er.message); });
+  },
+
+  /* ----- match portal ----- */
+  enableMatchLink: function (podId) {
+    var blurb = document.getElementById("match-blurb");
+    api("POST", "/api/pods/" + podId + "/match-link", { blurb: blurb ? blurb.value : "" })
+      .then(function () { loadPod(podId, state.podTab || "channels"); setOk("Match link live."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  revokeMatchLink: function (podId) {
+    if (!confirm("Revoke the client match link? Clients will see a 404.")) return;
+    api("DELETE", "/api/pods/" + podId + "/match-link")
+      .then(function () { loadPod(podId, state.podTab || "channels"); setOk("Match link revoked."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  copyMatchLink: function () {
+    var el = document.getElementById("match-url");
+    if (!el) return;
+    el.select();
+    try { document.execCommand("copy"); setOk("Link copied."); }
+    catch (e) { setErr("Copy failed — select the link manually."); }
   },
   createPeriod: function (e) {
     e.preventDefault();

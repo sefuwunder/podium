@@ -7,6 +7,10 @@ import {
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
   listPods, getPod, createPod, updatePod, deletePod,
   listMembers, addMember, removeMember, MAX_MEMBERS,
+  // phase 1: talent & pod allocation engine
+  listConflicts, addConflict, removeConflict, setMemberAllocation,
+  capacityReport, suggestPod, buildPod,
+  enableMatchLink, revokeMatchLink, matchPortalData, getPodByMatchSlug,
   listChannels, getChannel, createChannel, renameChannel, deleteChannel,
   listMessages, createMessage,
   listPages, getPage, createPage, updatePage, deletePage,
@@ -177,6 +181,16 @@ const server = Bun.serve({
       if (seg(1) === "api" && seg(2) === "people" && seg(4) === "enable-booking" && seg(3) && method === "POST") {
         return json({ slug: enableBookingSlug(seg(3)) });
       }
+      // ----- conflicts of interest (must precede the generic /api/people/:id branch) -----
+      if (seg(1) === "api" && seg(2) === "people" && seg(3) && seg(4) === "conflicts") {
+        if (!getPerson(seg(3))) return json({ error: "not found" }, 404);
+        if (method === "GET") return json({ conflicts: listConflicts(seg(3)) });
+        if (method === "POST") {
+          const b = await readBody(req);
+          return json({ conflict: addConflict(seg(3), b) }, 201);
+        }
+        if (seg(5) && method === "DELETE") return json({ ok: removeConflict(seg(5)) });
+      }
       if (seg(1) === "api" && seg(2) === "people" && seg(3)) {
         const p = getPerson(seg(3));
         if (!p) return json({ error: "not found" }, 404);
@@ -213,6 +227,10 @@ const server = Bun.serve({
         if (method === "POST") {
           const b = await readBody(req);
           return json({ member: addMember(podId, b.person_id, b.role || "") }, 201);
+        }
+        if (seg(5) && method === "PUT") {
+          const b = await readBody(req);
+          return json({ member: setMemberAllocation(podId, seg(5), b.allocated_hours ?? null) });
         }
         if (seg(5) && method === "DELETE") {
           return json({ ok: removeMember(podId, seg(5)) });
@@ -332,6 +350,28 @@ const server = Bun.serve({
 
       // ----- dashboard -----
       if (path === "/api/dashboard" && method === "GET") return json(dashboard());
+
+      // ----- talent & pod allocation engine -----
+      if (path === "/api/capacity" && method === "GET") return json({ capacity: capacityReport() });
+      if (path === "/api/pod-builder/suggest" && method === "POST") {
+        const b = await readBody(req);
+        return json({ suggestions: suggestPod({ skills: b.skills, hours: b.hours, exclude_company: b.exclude_company }) });
+      }
+      if (path === "/api/pod-builder/create" && method === "POST") {
+        return json(buildPod(await readBody(req)), 201);
+      }
+      if (seg(1) === "api" && seg(2) === "pods" && seg(3) && seg(4) === "match-link") {
+        if (!getPod(seg(3))) return json({ error: "not found" }, 404);
+        if (method === "POST") {
+          const b = await readBody(req);
+          const pod = enableMatchLink(seg(3), b.blurb);
+          return json({ pod, url: "/match/" + pod.match_slug });
+        }
+        if (method === "DELETE") return json({ pod: revokeMatchLink(seg(3)) });
+      }
+      if (seg(1) === "api" && seg(2) === "match" && seg(3) && method === "GET") {
+        return json(matchPortalData(seg(3)));
+      }
 
       // ----- CRM: partners -----
       if (path === "/api/partners" && method === "GET") return json({ partners: listPartners() });
@@ -468,6 +508,14 @@ const server = Bun.serve({
         if (!seg(3) && method === "POST") {
           return json({ booking: publicBook(seg(2), await readBody(req)) }, 201);
         }
+      }
+
+      // ----- client match portal (public, anonymized) -----
+      if (seg(1) === "match" && seg(2) && !seg(3) && method === "GET") {
+        if (!getPodByMatchSlug(seg(2))) return json({ error: "not found" }, 404);
+        const file = Bun.file(PUB + "/match.html");
+        if (await file.exists()) return new Response(file, { headers: { "Content-Type": "text/html" } });
+        return json({ error: "not found" }, 404);
       }
 
       // ----- invoices -----
