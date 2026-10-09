@@ -117,6 +117,32 @@ export function initDb() {
       reason TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_conflicts_person ON conflicts(person_id);
+    -- Phase 2: client portal & value-log engine
+    CREATE TABLE IF NOT EXISTS objectives (
+      id TEXT PRIMARY KEY, pod_id TEXT NOT NULL, title TEXT NOT NULL,
+      period TEXT NOT NULL DEFAULT '', progress_pct INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'on_track', created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_objectives_pod ON objectives(pod_id);
+    CREATE TABLE IF NOT EXISTS key_results (
+      id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, title TEXT NOT NULL,
+      target TEXT NOT NULL DEFAULT '', current TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_key_results_objective ON key_results(objective_id);
+    CREATE TABLE IF NOT EXISTS alerts (
+      id TEXT PRIMARY KEY, pod_id TEXT NOT NULL, kind TEXT NOT NULL,
+      message TEXT NOT NULL DEFAULT '', seen INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_alerts_pod ON alerts(pod_id, created_at);
+    CREATE TABLE IF NOT EXISTS page_signings (
+      id TEXT PRIMARY KEY, page_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
+      signer_name TEXT NOT NULL DEFAULT '', signer_email TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending', signed_at TEXT,
+      signature_hash TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_signings_page ON page_signings(page_id);
   `);
   // Column migrations for existing installs (PRAGMA-style).
   const ensureColumn = (table: string, name: string, ddl: string) => {
@@ -141,6 +167,11 @@ export function initDb() {
   ensureColumn("pods", "match_visible", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn("pods", "match_blurb", "TEXT NOT NULL DEFAULT ''");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pods_match_slug ON pods(match_slug) WHERE match_slug IS NOT NULL");
+  // Phase 2: client portal & value-log engine
+  ensureColumn("time_entries", "block_type", "TEXT NOT NULL DEFAULT 'hours'");
+  ensureColumn("time_entries", "decisions", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("leads", "budget_band", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("leads", "contact_method", "TEXT NOT NULL DEFAULT ''");
   seedTemplates();
 }
 
@@ -599,7 +630,13 @@ export function deletePage(id: string): boolean {
 }
 
 // ---------- time entries ----------
-export interface TimeEntry { id: string; person_id: string; pod_id: string; day: string; hours: number; note: string; billable: number; period_id: string | null; created_at: string; person_name?: string; pod_name?: string; }
+export interface TimeEntry { id: string; person_id: string; pod_id: string; day: string; hours: number; note: string; billable: number; period_id: string | null; created_at: string; person_name?: string; pod_name?: string; block_type: string; decisions: string; }
+export const BLOCK_TYPES = ["hours", "advisory", "sprint", "milestone"];
+function validBlockType(v: unknown): string {
+  const t = String(v || "hours").toLowerCase();
+  if (!BLOCK_TYPES.includes(t)) throw Object.assign(new Error("block_type must be one of " + BLOCK_TYPES.join(", ")), { status: 400 });
+  return t;
+}
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 export function validateTime(p: { person_id: string; pod_id: string; day: string; hours: number }) {
   const hours = Number(p.hours);
@@ -631,20 +668,22 @@ export function listEntries(f: { person_id?: string; pod_id?: string; from?: str
      ${wh.length ? "WHERE " + wh.join(" AND ") : ""} ORDER BY t.day, t.created_at`
   ).all(...args) as TimeEntry[];
 }
-export function createEntry(p: { person_id: string; pod_id: string; day: string; hours: number; note?: string; billable?: number }): TimeEntry {
+export function createEntry(p: { person_id: string; pod_id: string; day: string; hours: number; note?: string; billable?: number; block_type?: string; decisions?: string }): TimeEntry {
   const hours = validateTime(p);
-  const row = { id: uid(), person_id: p.person_id, pod_id: p.pod_id, day: p.day, hours, note: (p.note || "").trim(), billable: p.billable === 0 ? 0 : 1, period_id: null as string | null, created_at: nowIso() };
-  db.query("INSERT INTO time_entries (id, person_id, pod_id, day, hours, note, billable, period_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-    .run(row.id, row.person_id, row.pod_id, row.day, row.hours, row.note, row.billable, row.period_id, row.created_at);
+  const row = { id: uid(), person_id: p.person_id, pod_id: p.pod_id, day: p.day, hours, note: (p.note || "").trim(), billable: p.billable === 0 ? 0 : 1, period_id: null as string | null, created_at: nowIso(), block_type: validBlockType(p.block_type), decisions: String(p.decisions || "").trim().slice(0, 2000) };
+  db.query("INSERT INTO time_entries (id, person_id, pod_id, day, hours, note, billable, period_id, created_at, block_type, decisions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.person_id, row.pod_id, row.day, row.hours, row.note, row.billable, row.period_id, row.created_at, row.block_type, row.decisions);
   return row as TimeEntry;
 }
-export function updateEntry(id: string, p: { day?: string; hours?: number; note?: string; billable?: number; pod_id?: string }): TimeEntry | null {
+export function updateEntry(id: string, p: { day?: string; hours?: number; note?: string; billable?: number; pod_id?: string; block_type?: string; decisions?: string }): TimeEntry | null {
   const cur = getEntry(id); if (!cur) return null;
   if (entryLocked(id)) throw Object.assign(new Error("entry is in a closed pay period"), { status: 403 });
   const next = { person_id: cur.person_id, pod_id: p.pod_id || cur.pod_id, day: p.day || cur.day, hours: p.hours ?? cur.hours };
   const hours = validateTime(next);
-  db.query("UPDATE time_entries SET pod_id = ?, day = ?, hours = ?, note = ?, billable = ? WHERE id = ?")
-    .run(next.pod_id, next.day, hours, (p.note ?? cur.note).trim(), p.billable === undefined ? cur.billable : (p.billable ? 1 : 0), id);
+  const block_type = p.block_type === undefined ? cur.block_type : validBlockType(p.block_type);
+  const decisions = p.decisions === undefined ? cur.decisions : String(p.decisions || "").trim().slice(0, 2000);
+  db.query("UPDATE time_entries SET pod_id = ?, day = ?, hours = ?, note = ?, billable = ?, block_type = ?, decisions = ? WHERE id = ?")
+    .run(next.pod_id, next.day, hours, (p.note ?? cur.note).trim(), p.billable === undefined ? cur.billable : (p.billable ? 1 : 0), block_type, decisions, id);
   return getEntry(id);
 }
 export function deleteEntry(id: string): boolean {
@@ -826,7 +865,15 @@ export function seed() {
 
   const sun = new Date(from + "T12:00:00Z"); sun.setUTCDate(sun.getUTCDate() + 6);
   createPeriod({ label: "Week of " + from, start_day: from, end_day: sun.toISOString().slice(0, 10) });
-  console.log("seeded Podium: 2 pods, 7 people, channels, messages, pages, time entries, 1 open period");
+
+  // Phase 2: example objectives so the Objectives tab opens with a story
+  const q = new Date().getFullYear() + "-Q" + (Math.floor(new Date().getMonth() / 3) + 1);
+  const o1 = createObjective(acmePod.id, { title: "Cut monthly burn below $180k", period: q, progress_pct: 60, status: "on_track" });
+  createKeyResult(o1.id, { title: "Renegotiate distributor terms", target: "−$25k/mo", current: "−$14k/mo" });
+  createKeyResult(o1.id, { title: "Ops headcount plan signed off", target: "1 hire", current: "shortlist of 3" });
+  const o2 = createObjective(brightPod.id, { title: "Ship self-serve onboarding", period: q, progress_pct: 35, status: "at_risk" });
+  createKeyResult(o2.id, { title: "Activation rate", target: "40%", current: "28%" });
+  console.log("seeded Podium: 2 pods, 7 people, channels, messages, pages, time entries, 1 open period, 2 objectives");
 }
 
 // ---------- settings (secrets stay server-side; GET masks them) ----------
@@ -924,6 +971,14 @@ export interface Lead {
   temperature: string; priority: number; value_cents: number; stage: string; notes: string;
   partner_id: string | null; booking_id: string | null; pod_id: string | null; created_at: string;
   partner_name?: string; pod_name?: string;
+  budget_band: string; contact_method: string;
+}
+export const BUDGET_BANDS = ["<$5k/mo", "$5–10k/mo", "$10k+/mo"];
+function validBudgetBand(v: unknown): string {
+  const t = String(v || "").trim();
+  if (!t) return "";
+  if (!BUDGET_BANDS.includes(t)) throw Object.assign(new Error("budget_band must be one of " + BUDGET_BANDS.join(", ")), { status: 400 });
+  return t;
 }
 function leadWithJoins(where: string, ...args: any[]): Lead[] {
   return db.query(
@@ -960,11 +1015,13 @@ export function createLead(p: Partial<Lead> & { name: string }): Lead {
     temperature, priority, value_cents, stage, notes: (p.notes || "").trim(),
     partner_id: p.partner_id || null, booking_id: p.booking_id || null, pod_id: null as string | null,
     created_at: nowIso(),
+    budget_band: validBudgetBand(p.budget_band), contact_method: String(p.contact_method || "").trim().slice(0, 40),
   };
-  db.query(`INSERT INTO leads (id, name, company, email, phone, source, temperature, priority, value_cents, stage, notes, partner_id, booking_id, pod_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  db.query(`INSERT INTO leads (id, name, company, email, phone, source, temperature, priority, value_cents, stage, notes, partner_id, booking_id, pod_id, created_at, budget_band, contact_method)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(row.id, row.name, row.company, row.email, row.phone, row.source, row.temperature, row.priority,
-      row.value_cents, row.stage, row.notes, row.partner_id, row.booking_id, row.pod_id, row.created_at);
+      row.value_cents, row.stage, row.notes, row.partner_id, row.booking_id, row.pod_id, row.created_at,
+      row.budget_band, row.contact_method);
   return getLead(row.id)!;
 }
 export function updateLead(id: string, p: Partial<Lead>): Lead | null {
@@ -1177,13 +1234,13 @@ export function billableHours(elapsedSec: number): number {
 }
 const localDay = (d: Date) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-export function stopTimer(personId: string): { timer: Timer; entry: TimeEntry; hours: number; elapsed_sec: number } {
+export function stopTimer(personId: string, opts?: { block_type?: string; decisions?: string }): { timer: Timer; entry: TimeEntry; hours: number; elapsed_sec: number } {
   const t = activeTimerFor(personId);
   if (!t) throw Object.assign(new Error("no active timer for this person"), { status: 404 });
   const elapsed_sec = Math.max(0, (Date.now() - new Date(t.started_at).getTime()) / 1000);
   const hours = billableHours(elapsed_sec);
   if (hours > 24) throw Object.assign(new Error("timer ran over 24h — log it manually"), { status: 400 });
-  const entry = createEntry({ person_id: t.person_id, pod_id: t.pod_id, day: localDay(new Date()), hours, note: t.note || "Timer" });
+  const entry = createEntry({ person_id: t.person_id, pod_id: t.pod_id, day: localDay(new Date()), hours, note: t.note || "Timer", block_type: opts?.block_type, decisions: opts?.decisions });
   db.query("DELETE FROM timers WHERE id = ?").run(t.id);
   return { timer: t, entry, hours, elapsed_sec: Math.round(elapsed_sec) };
 }
@@ -1498,4 +1555,191 @@ export function setPodClickupList(podId: string, listId: string): void {
 }
 export function setInvoiceQboId(id: string, qboId: string): void {
   db.query("UPDATE invoices SET qbo_id = ? WHERE id = ?").run(qboId, id);
+}
+
+// ---------- Phase 2: objectives & key results ----------
+export interface KeyResult { id: string; objective_id: string; title: string; target: string; current: string; created_at: string; }
+export interface Objective { id: string; pod_id: string; title: string; period: string; progress_pct: number; status: string; created_at: string; key_results: KeyResult[]; }
+export const OBJECTIVE_STATUSES = ["on_track", "at_risk", "done"];
+function validObjectiveStatus(v: unknown): string {
+  const s = String(v || "on_track").toLowerCase();
+  if (!OBJECTIVE_STATUSES.includes(s)) throw Object.assign(new Error("status must be one of " + OBJECTIVE_STATUSES.join(", ")), { status: 400 });
+  return s;
+}
+function validProgress(v: unknown): number {
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n) || n < 0 || n > 100) throw Object.assign(new Error("progress_pct must be 0–100"), { status: 400 });
+  return n;
+}
+export function listObjectives(podId: string): Objective[] {
+  return (db.query("SELECT * FROM objectives WHERE pod_id = ? ORDER BY created_at").all(podId) as any[])
+    .map((o) => ({ ...o, key_results: listKeyResults(o.id) }));
+}
+export function getObjective(id: string): Objective | null {
+  const o = db.query("SELECT * FROM objectives WHERE id = ?").get(id) as any;
+  return o ? { ...o, key_results: listKeyResults(o.id) } : null;
+}
+export function createObjective(podId: string, p: { title: string; period?: string; progress_pct?: number; status?: string }): Objective {
+  if (!getPod(podId)) throw Object.assign(new Error("pod not found"), { status: 404 });
+  if (!p.title?.trim()) throw Object.assign(new Error("title is required"), { status: 400 });
+  const row = { id: uid(), pod_id: podId, title: p.title.trim(), period: String(p.period || "").trim().slice(0, 12), progress_pct: p.progress_pct == null ? 0 : validProgress(p.progress_pct), status: validObjectiveStatus(p.status), created_at: nowIso() };
+  db.query("INSERT INTO objectives (id, pod_id, title, period, progress_pct, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.pod_id, row.title, row.period, row.progress_pct, row.status, row.created_at);
+  return getObjective(row.id)!;
+}
+export function updateObjective(id: string, p: { title?: string; period?: string; progress_pct?: number; status?: string }): Objective | null {
+  const cur = db.query("SELECT * FROM objectives WHERE id = ?").get(id) as any;
+  if (!cur) return null;
+  const next = {
+    title: (p.title ?? cur.title).trim() || cur.title,
+    period: String(p.period ?? cur.period).trim().slice(0, 12),
+    progress_pct: p.progress_pct == null ? cur.progress_pct : validProgress(p.progress_pct),
+    status: p.status === undefined ? cur.status : validObjectiveStatus(p.status),
+  };
+  db.query("UPDATE objectives SET title = ?, period = ?, progress_pct = ?, status = ? WHERE id = ?")
+    .run(next.title, next.period, next.progress_pct, next.status, id);
+  return getObjective(id);
+}
+export function deleteObjective(id: string): boolean {
+  db.query("DELETE FROM key_results WHERE objective_id = ?").run(id);
+  return db.query("DELETE FROM objectives WHERE id = ?").run(id).changes > 0;
+}
+export function listKeyResults(objectiveId: string): KeyResult[] {
+  return db.query("SELECT * FROM key_results WHERE objective_id = ? ORDER BY created_at").all(objectiveId) as KeyResult[];
+}
+export function createKeyResult(objectiveId: string, p: { title: string; target?: string; current?: string }): KeyResult {
+  if (!db.query("SELECT 1 FROM objectives WHERE id = ?").get(objectiveId))
+    throw Object.assign(new Error("objective not found"), { status: 404 });
+  if (!p.title?.trim()) throw Object.assign(new Error("title is required"), { status: 400 });
+  const row = { id: uid(), objective_id: objectiveId, title: p.title.trim(), target: String(p.target || "").trim().slice(0, 200), current: String(p.current || "").trim().slice(0, 200), created_at: nowIso() };
+  db.query("INSERT INTO key_results (id, objective_id, title, target, current, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.objective_id, row.title, row.target, row.current, row.created_at);
+  return db.query("SELECT * FROM key_results WHERE id = ?").get(row.id) as KeyResult;
+}
+export function updateKeyResult(id: string, p: { title?: string; target?: string; current?: string }): KeyResult | null {
+  const cur = db.query("SELECT * FROM key_results WHERE id = ?").get(id) as any;
+  if (!cur) return null;
+  const next = {
+    title: (p.title ?? cur.title).trim() || cur.title,
+    target: String(p.target ?? cur.target).trim().slice(0, 200),
+    current: String(p.current ?? cur.current).trim().slice(0, 200),
+  };
+  db.query("UPDATE key_results SET title = ?, target = ?, current = ? WHERE id = ?")
+    .run(next.title, next.target, next.current, id);
+  return db.query("SELECT * FROM key_results WHERE id = ?").get(id) as KeyResult;
+}
+export function deleteKeyResult(id: string): boolean {
+  return db.query("DELETE FROM key_results WHERE id = ?").run(id).changes > 0;
+}
+
+// ---------- Phase 2: scope-drift alerts ----------
+export interface Alert { id: string; pod_id: string; kind: string; message: string; seen: number; created_at: string; pod_name?: string; }
+export function listAlerts(unseenOnly = false): Alert[] {
+  const rows = db.query(
+    `SELECT a.*, p.name AS pod_name FROM alerts a LEFT JOIN pods p ON p.id = a.pod_id
+     ${unseenOnly ? "WHERE a.seen = 0" : ""} ORDER BY a.created_at DESC LIMIT 100`
+  ).all() as Alert[];
+  return rows;
+}
+export function unseenAlertCount(): number {
+  return (db.query("SELECT COUNT(*) AS c FROM alerts WHERE seen = 0").get() as { c: number }).c;
+}
+export function markAlertSeen(id: string): boolean {
+  return db.query("UPDATE alerts SET seen = 1 WHERE id = ?").run(id).changes > 0;
+}
+function monthStart(d = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+}
+/** Create an alert unless one of the same kind already exists for this pod this month. */
+function createAlertOnce(podId: string, kind: string, message: string): Alert | null {
+  const dup = db.query("SELECT 1 FROM alerts WHERE pod_id = ? AND kind = ? AND created_at >= ?").get(podId, kind, monthStart());
+  if (dup) return null;
+  const row = { id: uid(), pod_id: podId, kind, message, seen: 0, created_at: nowIso() };
+  db.query("INSERT INTO alerts (id, pod_id, kind, message, seen, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.pod_id, row.kind, row.message, row.seen, row.created_at);
+  return { ...row, pod_name: getPod(podId)?.name } as Alert;
+}
+/** Recompute retainer usage after a time entry lands; fire 80%/100% alerts at first crossing. Returns any new alert. */
+export function checkRetainerAlerts(podId: string): Alert | null {
+  const pod = getPod(podId);
+  if (!pod || pod.billing_type !== "retainer" || !pod.retainer_hours) return null;
+  const usage = retainerUsage(podId);
+  if (!usage) return null;
+  const link = `#/pod/${podId}/time`;
+  if (usage.pct >= 1) {
+    return createAlertOnce(podId, "overage_100",
+      `${pod.name} hit 100% of its ${usage.cap}h retainer (${usage.hours}h logged). Adjust the retainer: ${link}`);
+  }
+  if (usage.pct >= 0.8) {
+    return createAlertOnce(podId, "overage_80",
+      `${pod.name} is at ${Math.round(usage.pct * 100)}% of its ${usage.cap}h retainer (${usage.hours}h logged). Consider an upsell or retainer adjustment: ${link}`);
+  }
+  return null;
+}
+
+// ---------- Phase 2: SOW e-signing (built-in ceremony, no third party) ----------
+import { createHash } from "node:crypto";
+export interface PageSigning { id: string; page_id: string; token: string; signer_name: string; signer_email: string; status: string; signed_at: string | null; signature_hash: string; created_at: string; }
+function signingToken(): string {
+  const b = new Uint8Array(32);
+  (globalThis.crypto as any).getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+export function getPageSigningForPage(pageId: string): PageSigning | null {
+  return (db.query("SELECT * FROM page_signings WHERE page_id = ? ORDER BY created_at DESC LIMIT 1").get(pageId) as PageSigning) || null;
+}
+export function getSigningByToken(token: string): (PageSigning & { page_title?: string; page_body?: string }) | null {
+  const s = db.query(
+    `SELECT s.*, p.title AS page_title, p.body_md AS page_body FROM page_signings s
+     JOIN pages p ON p.id = s.page_id WHERE s.token = ?`
+  ).get(token) as any;
+  return s || null;
+}
+export function createPageSigning(pageId: string, p: { signer_name: string; signer_email: string }): PageSigning {
+  if (!getPage(pageId)) throw Object.assign(new Error("page not found"), { status: 404 });
+  const email = String(p.signer_email || "").trim();
+  if (!p.signer_name?.trim()) throw Object.assign(new Error("signer_name is required"), { status: 400 });
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw Object.assign(new Error("a valid signer_email is required"), { status: 400 });
+  db.query("DELETE FROM page_signings WHERE page_id = ?").run(pageId); // one active ceremony per page
+  const row: PageSigning = { id: uid(), page_id: pageId, token: signingToken(), signer_name: p.signer_name.trim().slice(0, 120), signer_email: email.slice(0, 160), status: "pending", signed_at: null, signature_hash: "", created_at: nowIso() };
+  db.query("INSERT INTO page_signings (id, page_id, token, signer_name, signer_email, status, signed_at, signature_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.page_id, row.token, row.signer_name, row.signer_email, row.status, row.signed_at, row.signature_hash, row.created_at);
+  return row;
+}
+export function revokePageSigning(pageId: string): boolean {
+  return db.query("DELETE FROM page_signings WHERE page_id = ?").run(pageId).changes > 0;
+}
+/** The signature hash binds the exact page body to the signer + moment. Deterministic and verifiable. */
+export function signatureHash(pageBody: string, signerName: string, signerEmail: string, signedAt: string): string {
+  return createHash("sha256").update(`${pageBody}\n${signerName}\n${signerEmail}\n${signedAt}`).digest("hex");
+}
+export function signPageSigning(token: string, signerName: string): PageSigning {
+  const s = getSigningByToken(token);
+  if (!s) throw Object.assign(new Error("signing link not found or revoked"), { status: 404 });
+  if (s.status === "signed") throw Object.assign(new Error("already signed"), { status: 409 });
+  const name = String(signerName || "").trim();
+  if (!name) throw Object.assign(new Error("signer_name is required"), { status: 400 });
+  const signedAt = nowIso();
+  const hash = signatureHash(s.page_body || "", name, s.signer_email, signedAt);
+  db.query("UPDATE page_signings SET status = 'signed', signed_at = ?, signature_hash = ?, signer_name = ? WHERE id = ?")
+    .run(signedAt, hash, name.slice(0, 120), s.id);
+  return getSigningByToken(token)!;
+}
+
+// ---------- Phase 2: public intake → lead ----------
+const INTAKE_EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+export function createIntakeLead(p: { name: string; company: string; email: string; phone?: string; needs?: string; budget_band?: string; contact_method?: string }): Lead {
+  const name = String(p.name || "").trim();
+  const company = String(p.company || "").trim();
+  const email = String(p.email || "").trim();
+  if (!name) throw Object.assign(new Error("name is required"), { status: 400 });
+  if (!company) throw Object.assign(new Error("company is required"), { status: 400 });
+  if (!INTAKE_EMAIL_RE.test(email)) throw Object.assign(new Error("a valid email is required"), { status: 400 });
+  return createLead({
+    name, company, email,
+    phone: String(p.phone || "").trim().slice(0, 40),
+    source: "intake", temperature: "warm", priority: 4,
+    notes: String(p.needs || "").trim().slice(0, 2000),
+    budget_band: p.budget_band, contact_method: p.contact_method,
+  });
 }

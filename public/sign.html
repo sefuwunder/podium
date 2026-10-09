@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign — Podium</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="public-wrap">
+  <div class="card public-card">
+    <div class="public-brand">Podium<span>.</span></div>
+    <div id="sign-body"><div class="muted">Loading…</div></div>
+  </div>
+</div>
+<script>
+(function () {
+  var token = location.pathname.split("/")[2] || "";
+  var el = document.getElementById("sign-body");
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function md(src) {
+    var lines = String(src || "").split("\n"), html = "", inList = false;
+    lines.forEach(function (ln) {
+      var t = ln.trim();
+      if (/^###\s/.test(t)) { if (inList) { html += "</ul>"; inList = false; } html += "<h3>" + esc(t.slice(4)) + "</h3>"; }
+      else if (/^##\s/.test(t)) { if (inList) { html += "</ul>"; inList = false; } html += "<h2>" + esc(t.slice(3)) + "</h2>"; }
+      else if (/^#\s/.test(t)) { if (inList) { html += "</ul>"; inList = false; } html += "<h1>" + esc(t.slice(2)) + "</h1>"; }
+      else if (/^[-*]\s/.test(t)) { if (!inList) { html += "<ul>"; inList = true; } html += "<li>" + esc(t.slice(2)) + "</li>"; }
+      else if (t === "") { if (inList) { html += "</ul>"; inList = false; } }
+      else {
+        if (inList) { html += "</ul>"; inList = false; }
+        html += "<p>" + esc(t).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/\*(.+?)\*/g, "<em>$1</em>") + "</p>";
+      }
+    });
+    if (inList) html += "</ul>";
+    return html;
+  }
+  function signedView(s) {
+    return '<div class="sign-banner signed"><b>Signed</b> by ' + esc(s.signer_name) +
+      ' <span class="muted">on ' + esc(String(s.signed_at || "").slice(0, 10) + '</span>' +
+      '<div class="muted mono" style="margin-top:6px">hash ' + esc(s.signature_hash) + '</div></div>';
+  }
+  function formView(s, page) {
+    return '<h2 style="margin:12px 0 4px">' + esc(page.title) + '</h2>' +
+      '<div class="msg-body" style="max-height:50vh;overflow:auto;border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:16px">' + md(page.body_md) + '</div>' +
+      '<h3>Sign this document</h3>' +
+      '<p class="muted">Signing for <b>' + esc(s.signer_name) + '</b> &lt;' + esc(s.signer_email) + '&gt;. Type your full name below exactly as it appears on the document, then click Sign.</p>' +
+      '<label>Your typed name</label>' +
+      '<input id="sign-name" maxlength="120" autocomplete="name" placeholder="Type your full name">' +
+      '<div id="sign-err" class="err" style="display:none;margin-top:10px"></div>' +
+      '<div style="margin-top:12px"><button class="btn" id="sign-btn">Sign</button></div>' +
+      '<p class="muted" style="margin-top:12px;font-size:12px">Your signature is sealed with a SHA-256 hash binding this document, your name, your email, and the signing time.</p>';
+  }
+  fetch("/api/sign/" + encodeURIComponent(token))
+    .then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok) throw new Error(j.error || "not found");
+        var s = j.signing, page = j.page;
+        if (s.status === "signed") {
+          el.innerHTML = '<h2 style="margin:12px 0 4px">' + esc(page.title) + '</h2>' +
+            '<div class="msg-body" style="margin-bottom:16px">' + md(page.body_md) + '</div>' + signedView(s);
+          return;
+        }
+        el.innerHTML = formView(s, page);
+        var btn = document.getElementById("sign-btn"),
+            input = document.getElementById("sign-name"),
+            err = document.getElementById("sign-err");
+        input.value = s.signer_name || "";
+        btn.addEventListener("click", function () {
+          err.style.display = "none";
+          if (!input.value.trim()) { err.textContent = "Please type your name."; err.style.display = "block"; return; }
+          btn.disabled = true; btn.textContent = "Signing…";
+          fetch("/api/sign/" + encodeURIComponent(token) + "/sign", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ signer_name: input.value.trim() })
+          }).then(function (r2) {
+            return r2.json().then(function (j2) {
+              if (!r2.ok) throw new Error(j2.error || "Signing failed");
+              el.innerHTML = '<h2 style="margin:12px 0 4px">' + esc(page.title) + '</h2>' + signedView(j2.signing);
+            });
+          }).catch(function (ex) {
+            err.textContent = ex.message; err.style.display = "block";
+            btn.disabled = false; btn.textContent = "Sign";
+          });
+        });
+      });
+    })
+    .catch(function (ex) {
+      el.innerHTML = '<div class="err">' + esc(ex.message) + '</div><p class="muted">This signing link is invalid or has been revoked.</p>';
+    });
+})();
+</script>
+</body>
+</html>

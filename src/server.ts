@@ -28,6 +28,12 @@ import {
   listBookings, getBooking, createBooking, publicBook, cancelBooking, linkBookingLead, freeSlots,
   listInvoices, getInvoice, generateInvoice, sendInvoice, voidInvoice, markInvoicePaid, getInvoiceByStripeId, invoicesCsv,
   setPodStripeIds, setPodStripeCustomer, setPodSlackChannel, setPodClickupList, setInvoiceQboId,
+  // phase 2: client portal & value-log engine
+  listObjectives, getObjective, createObjective, updateObjective, deleteObjective,
+  createKeyResult, updateKeyResult, deleteKeyResult,
+  listAlerts, unseenAlertCount, markAlertSeen, checkRetainerAlerts,
+  getPageSigningForPage, getSigningByToken, createPageSigning, revokePageSigning, signPageSigning,
+  createIntakeLead, BUDGET_BANDS,
 } from "./db.ts";
 import {
   stripeCreateCustomer, stripeCreatePrice, stripeCreateSubscription,
@@ -127,9 +133,18 @@ if (MOCK) {
   };
 }
 
+/** Light intake rate limiting: max 10 submissions/hour per IP (in-memory). */
+const intakeHits = new Map<string, number[]>();
+function intakeAllowed(ip: string): boolean {
+  const now = Date.now(), hour = 3600_000;
+  const hits = (intakeHits.get(ip) || []).filter((t) => now - t < hour);
+  if (hits.length >= 10) { intakeHits.set(ip, hits); return false; }
+  hits.push(now); intakeHits.set(ip, hits);
+  return true;
+}
+
 /** Best-effort Slack notification — never breaks the request. */
-async function notifySlack(podId: string | null, text: string): Promise<void> {
-  try {
+async function notifySlack(podId: string | null, text: string): Promise<void> {  try {
     if (!podId) return;
     const token = getSetting("slack_bot_token");
     const pod = getPod(podId);
@@ -280,12 +295,55 @@ const server = Bun.serve({
           return json({ page: createPage(podId, b) }, 201);
         }
       }
-      if (seg(1) === "api" && seg(2) === "pages" && seg(3)) {
+      if (seg(1) === "api" && seg(2) === "pages" && seg(3) && seg(4) === "signing") {
+        if (!getPage(seg(3))) return json({ error: "not found" }, 404);
+        if (method === "GET") return json({ signing: getPageSigningForPage(seg(3)) });
+        if (method === "POST") return json({ signing: createPageSigning(seg(3), await readBody(req)) }, 201);
+        if (method === "DELETE") { revokePageSigning(seg(3)); return json({ ok: true }); }
+      }
+      if (seg(1) === "api" && seg(2) === "pages" && seg(3) && !seg(4)) {
         const pg = getPage(seg(3));
         if (!pg) return json({ error: "not found" }, 404);
         if (method === "GET") return json({ page: pg });
         if (method === "PUT") return json({ page: updatePage(seg(3), await readBody(req)) });
         if (method === "DELETE") { deletePage(seg(3)); return json({ ok: true }); }
+      }
+
+      // ----- objectives & key results -----
+      if (seg(1) === "api" && seg(2) === "pods" && seg(4) === "objectives" && seg(3)) {
+        if (!getPod(seg(3))) return json({ error: "not found" }, 404);
+        if (method === "GET") return json({ objectives: listObjectives(seg(3)) });
+        if (method === "POST") return json({ objective: createObjective(seg(3), await readBody(req)) }, 201);
+      }
+      if (seg(1) === "api" && seg(2) === "objectives" && seg(3) && !seg(4)) {
+        if (method === "GET") {
+          const o = getObjective(seg(3));
+          return o ? json({ objective: o }) : json({ error: "not found" }, 404);
+        }
+        if (method === "PUT") {
+          const o = updateObjective(seg(3), await readBody(req));
+          return o ? json({ objective: o }) : json({ error: "not found" }, 404);
+        }
+        if (method === "DELETE") return json({ ok: deleteObjective(seg(3)) });
+      }
+      if (seg(1) === "api" && seg(2) === "objectives" && seg(4) === "key-results" && seg(3) && method === "POST") {
+        return json({ key_result: createKeyResult(seg(3), await readBody(req)) }, 201);
+      }
+      if (seg(1) === "api" && seg(2) === "key-results" && seg(3)) {
+        if (method === "PUT") {
+          const kr = updateKeyResult(seg(3), await readBody(req));
+          return kr ? json({ key_result: kr }) : json({ error: "not found" }, 404);
+        }
+        if (method === "DELETE") return json({ ok: deleteKeyResult(seg(3)) });
+      }
+
+      // ----- scope-drift alerts -----
+      if (path === "/api/alerts" && method === "GET") {
+        const unseenOnly = url.searchParams.get("unseen") === "1";
+        return json({ alerts: listAlerts(unseenOnly), unseen: unseenAlertCount() });
+      }
+      if (seg(1) === "api" && seg(2) === "alerts" && seg(4) === "seen" && seg(3) && method === "POST") {
+        return json({ ok: markAlertSeen(seg(3)) });
       }
 
       // ----- time entries -----
@@ -304,7 +362,10 @@ const server = Bun.serve({
       }
       if (path === "/api/time" && method === "POST") {
         const b = await readBody(req);
-        return json({ entry: createEntry(b) }, 201);
+        const entry = createEntry(b);
+        const alert = checkRetainerAlerts(entry.pod_id);
+        if (alert) notifySlack(entry.pod_id, `Scope drift: ${alert.message.split(".")[0]}.`);
+        return json({ entry, alert }, 201);
       }
       if (seg(1) === "api" && seg(2) === "time" && seg(3)) {
         if (method === "PUT") {
@@ -437,10 +498,13 @@ const server = Bun.serve({
         return json({ timer: t }, 201);
       }
       if (path === "/api/timer/stop" && method === "POST") {
-        const r = stopTimer((await readBody(req)).person_id);
+        const b = await readBody(req);
+        const r = stopTimer(b.person_id, { block_type: b.block_type, decisions: b.decisions });
         const person = getPerson(r.timer.person_id), pod = getPod(r.timer.pod_id);
         notifySlack(r.timer.pod_id, `${person?.name || "Someone"} logged ${r.hours}h on ${pod?.name || "a pod"}${r.timer.note ? ` — ${r.timer.note}` : ""}.`);
-        return json(r);
+        const alert = checkRetainerAlerts(r.timer.pod_id);
+        if (alert) notifySlack(r.timer.pod_id, `Scope drift: ${alert.message.split(".")[0]}.`);
+        return json({ ...r, alert });
       }
       if (path === "/api/timer/status" && method === "GET") {
         const withElapsed = (t: any) => ({ ...t, elapsed_sec: Math.max(0, Math.round((Date.now() - new Date(t.started_at).getTime()) / 1000)) });
@@ -516,6 +580,37 @@ const server = Bun.serve({
         const file = Bun.file(PUB + "/match.html");
         if (await file.exists()) return new Response(file, { headers: { "Content-Type": "text/html" } });
         return json({ error: "not found" }, 404);
+      }
+
+      // ----- public intake form → lead -----
+      if (path === "/intake" && method === "GET") {
+        const file = Bun.file(PUB + "/intake.html");
+        if (await file.exists()) return new Response(file, { headers: { "Content-Type": "text/html" } });
+        return json({ error: "not found" }, 404);
+      }
+      if (path === "/api/intake" && method === "POST") {
+        const ip = req.headers.get("x-forwarded-for")?.split(",")[0].trim() || "local";
+        if (!intakeAllowed(ip)) return json({ error: "too many requests — try again later" }, 429);
+        const b = await readBody(req);
+        const lead = createIntakeLead(b);
+        return json({ lead, budget_bands: BUDGET_BANDS }, 201);
+      }
+
+      // ----- SOW e-signing ceremony (public, token-gated) -----
+      if (seg(1) === "sign" && seg(2) && !seg(3) && method === "GET") {
+        if (!getSigningByToken(seg(2))) return json({ error: "not found" }, 404);
+        const file = Bun.file(PUB + "/sign.html");
+        if (await file.exists()) return new Response(file, { headers: { "Content-Type": "text/html" } });
+        return json({ error: "not found" }, 404);
+      }
+      if (seg(1) === "api" && seg(2) === "sign" && seg(3) && !seg(4) && method === "GET") {
+        const s = getSigningByToken(seg(3));
+        if (!s) return json({ error: "not found" }, 404);
+        return json({ signing: { token: s.token, signer_name: s.signer_name, signer_email: s.signer_email, status: s.status, signed_at: s.signed_at, signature_hash: s.signature_hash }, page: { id: s.page_id, title: s.page_title, body_md: s.page_body } });
+      }
+      if (seg(1) === "api" && seg(2) === "sign" && seg(3) && seg(4) === "sign" && method === "POST") {
+        const s = signPageSigning(seg(3), (await readBody(req)).signer_name);
+        return json({ signing: s });
       }
 
       // ----- invoices -----

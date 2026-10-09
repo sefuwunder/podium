@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Work with us — Podium</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="public-wrap">
+  <div class="card public-card">
+    <div class="public-brand">Podium<span>.</span></div>
+    <div class="muted" style="margin-bottom:18px">Tell us what you're building — a fractional exec team, assembled around you.</div>
+    <form id="intake-form">
+      <div class="form-row">
+        <div><label>Your name *</label><input name="name" required maxlength="120" autocomplete="name" placeholder="Jane Founder"></div>
+        <div><label>Company *</label><input name="company" required maxlength="160" autocomplete="organization" placeholder="Acme Foods Inc"></div>
+      </div>
+      <div class="form-row">
+        <div><label>Email *</label><input name="email" type="email" required maxlength="160" autocomplete="email" placeholder="jane@acme.com"></div>
+        <div><label>Phone <span class="muted">(optional)</span></label><input name="phone" maxlength="40" autocomplete="tel" placeholder="+1 555 010 2030"></div>
+      </div>
+      <label>What do you need? *</label>
+      <textarea name="needs" rows="4" maxlength="2000" placeholder="A few sentences about the challenge, the timeline, and what good looks like."></textarea>
+      <div class="form-row">
+        <div><label>Budget band</label><select name="budget_band">
+          <option value="">Prefer not to say</option>
+          <option>&lt;$5k/mo</option>
+          <option>$5–10k/mo</option>
+          <option>$10k+/mo</option>
+        </select></div>
+        <div><label>Preferred contact method</label><select name="contact_method">
+          <option>Email</option>
+          <option>Phone</option>
+          <option>Text / SMS</option>
+        </select></div>
+      </div>
+      <div id="intake-err" class="err" style="display:none;margin-top:10px"></div>
+      <div style="margin-top:16px"><button class="btn" type="submit" id="intake-btn">Request an intro</button></div>
+    </form>
+    <div id="intake-done" style="display:none">
+      <h2 style="margin-top:0">Thank you — we got it.</h2>
+      <p class="muted">A partner will reach out within one business day. Meanwhile, if it's urgent, reply to the confirmation in your inbox.</p>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  var form = document.getElementById("intake-form"),
+      done = document.getElementById("intake-done"),
+      err = document.getElementById("intake-err"),
+      btn = document.getElementById("intake-btn");
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    err.style.display = "none";
+    var body = {};
+    new FormData(form).forEach(function (v, k) { body[k] = String(v).trim(); });
+    if (!body.name || !body.company || !body.email) {
+      err.textContent = "Name, company, and email are required.";
+      err.style.display = "block";
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "Sending…";
+    fetch("/api/intake", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) {
+        return r.json().then(function (j) {
+          if (!r.ok) throw new Error(j.error || "Something went wrong");
+          form.style.display = "none";
+          done.style.display = "block";
+        });
+      })
+      .catch(function (ex) {
+        err.textContent = ex.message;
+        err.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Request an intro";
+      });
+  });
+})();
+</script>
+</body>
+</html>

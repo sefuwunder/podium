@@ -33,6 +33,11 @@ bun src/server.ts
 - **Talent** — exec skill matrix + capacity dashboard: per-exec monthly cap (max weekly hours × 4.33), allocated hours across pods, load bars (green <70%, amber 70–95%, red >95%), skill filter, conflict-of-interest badges. People carry skills, rate tier (I/II/III or $/$$/$$$), and an optional bio.
 - **Pod builder** — enter a client company, required skills, and target monthly hours; execs are ranked (+2 per matching skill, +1 when the hours fit their free capacity; conflicted execs are excluded outright). One-click "Create pod" spins up `<Company> Pod` with per-exec monthly allocations.
 - **Client match portal** — per-pod public link (`/match/:slug`, anonymized: first name + last initial, title, skill tags, rate band, bio — no emails, full names, or dollar rates). Enable/revoke from the pod view; revoked or invisible slugs 404.
+- **Public intake** — standalone `/intake` page (no sidebar): name, company, email, phone, needs, budget band, contact method → creates a lead in `intro` stage with `source='intake'`, visible in the normal Pipeline. Light IP rate limiting (10/hour, in-memory); no CAPTCHA in v1.
+- **Objectives** — per-pod OKR/milestone dashboard: objectives with progress bars, key results, inline progress + status updates, add forms. Demo pods ship with a seeded example.
+- **Value log** — time entries carry a block type (`hours` / `advisory` / `sprint` / `milestone`) plus freeform "key decisions / assets" bullets. The Time tab toggles between Timesheet and Value log (entries grouped by week with block pills and decision bullets — the value-delivered narrative the client sees). Timer stop asks for block type + decisions; both editable afterward. Payroll/invoice math still sums plain hours.
+- **Scope-drift alerts** — when a time entry lands on a retainer pod, usage is recomputed; first crossing of 80% / 100% of the cap creates an in-app alert (one per pod per month per kind) with an "Adjust retainer" deep link to the pod's billing section. Firm header bell with unread badge; Slack post to the pod's channel when connected.
+- **SOW e-signing (built-in)** — any wiki page can be sent for signature: enter signer name/email → token link `/sign/:token` shows the rendered SOW; the client types their name and signs. `signature_hash` = SHA-256 hex of (page body + signer name + email + timestamp). Page shows a Pending/Signed banner with hash prefix; revoking deletes the ceremony (links 404).
 
 ### Payroll scope — a judgment call
 
@@ -57,6 +62,15 @@ Podium does **calculation + statements + CSV export**. No money moves through Po
 - **Rate tier is shown, never scored** — the builder ranks on skills + capacity fit only.
 - **Match portal anonymization is enforced server-side** (`matchPortalData` builds fresh objects — no email/full-name fields exist to leak), and the public `/match/:slug` page 404s on revoked/invisible slugs.
 - **The client-need blurb** (`match_blurb`) is firm-written marketing copy shown on the match page — editable when the link is enabled.
+
+### Client-portal judgment calls
+
+- **Built-in e-signing instead of DocuSign for v1**: a typed-name ceremony with a SHA-256 hash binding (page body + signer + email + timestamp) is verifiable today with no third-party account, no per-envelope fees, and zero new dependencies. DocuSign remains the enterprise upgrade path (audit trail, identity verification, legal enforceability tooling) — the `page_signings` table is shaped to migrate.
+- **Timer-stop asks for block metadata**: stopping the timer opens an inline confirm (block type + decisions) rather than silently defaulting — the value log is only useful if the data is captured at the moment, and both fields stay editable afterward.
+- **Alerts are in-app + Slack only in v1**: no emails are sent. Email notifications (digest of unseen alerts) are noted as future work.
+- **Alert dedupe is per pod per month per kind**: crossing 80% twice in a month fires once; the 100% alert is separate. The message links straight to the pod's Time tab where the retainer bar lives ("Adjust retainer").
+- **Value log groups by week, last 4 weeks**: the Timesheet stays a single week; flipping to Value log widens to 4 weeks so the narrative has room to breathe.
+- **Intake rate limit is in-memory** (10/hour/IP): restarts clear it; good enough for v1 spam hygiene alongside the required-field validation.
 
 ## API
 
@@ -118,6 +132,8 @@ Integrations: lead stage machine, spin-up-pod money loop, Top-20 ordering, templ
 
 Talent (`tests/talent-check.test.ts`, 21 tests): person skill/tier/bio fields + validation, conflicts CRUD, capacity math (explicit hours, retainer even-split fallback, hourly = 0, unlimited cap), builder scoring (+2/skill, +1 capacity fit), conflict exclusion, builder pod creation (naming, members, hours, validation), match portal (enable/revoke, anonymization of HTML + JSON — no email/full-name leaks, 404s for bogus and revoked slugs), and DOM-stubbed renders of the Talent/Builder/match-portal views.
 
+Client portal & value-log (`tests/client-portal-check.test.ts`, 34 tests): intake validation + budget-band whitelist + IP rate limit + pipeline visibility, objectives/KR CRUD + validation + cascade delete + seeded examples, block_type/decisions on entries (create/edit/timer-stop) + invalid-type rejection, alert crossing (79→81 fires once, 85% silent, 100% fires) + unseen filter + mark-seen + Slack post via mocked fetch, full signing ceremony (token entropy, pending→signed, SHA-256 hash recomputation, double-sign 409, revoke → 404), public `/intake` + `/sign/:token` pages, and DOM-stubbed renders of Objectives/Alerts/Value-log/Signing-banner plus stylesheet checks.
+
 ## Seed data
 
-First boot seeds 2 pods ("Acme Foods" — 4 execs; "Brightline" — 3 execs, one shared), channels with threaded messages, wiki pages, this week's time entries, and one open pay period.
+First boot seeds 2 pods ("Acme Foods" — 4 execs; "Brightline" — 3 execs, one shared), channels with threaded messages, wiki pages, this week's time entries, one open pay period, and one example objective per pod (with key results).

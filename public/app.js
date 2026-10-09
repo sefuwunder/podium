@@ -96,6 +96,8 @@ var state = {
   periods: [], period: null,
   tasks: [], tasksErr: "", inbox: null, inboxLoading: false,
   talent: [], talentFilter: "", talentSort: "load", builder: null, conflictsPanel: null,
+  objectives: [], alerts: [], alertCount: 0, signing: null, showSigningForm: false,
+  valueLog: false, stopTimerFor: null,
   err: "", okMsg: "",
 };
 function setErr(m) { state.err = m; state.okMsg = ""; render(); if (!reducedMotion && typeof document !== "undefined") window.scrollTo(0, 0); }
@@ -108,6 +110,7 @@ function route() {
   state.err = ""; state.okMsg = "";
   state.replyTo = null; state.editingPage = false; state.page = null;
   var v = parts[0] || "home";
+  refreshAlertCount();
   if (v === "home") return loadHome();
   if (v === "pods") return loadPods();
   if (v === "pod" && parts[1]) return loadPod(parts[1], parts[2] || "channels");
@@ -119,10 +122,21 @@ function route() {
   if (v === "schedule") return loadSchedule();
   if (v === "invoices") return loadInvoices(parts[1] || null);
   if (v === "settings") return loadSettings();
+  if (v === "alerts") return loadAlerts();
   return loadHome();
 }
 
 /* ---------- data loaders ---------- */
+function refreshAlertCount() {
+  api("GET", "/api/alerts?unseen=1").then(function (r) {
+    if (r.unseen !== state.alertCount) { state.alertCount = r.unseen; render(); }
+  }).catch(function () { /* badge is best-effort */ });
+}
+function loadAlerts() {
+  api("GET", "/api/alerts").then(function (r) {
+    state.alerts = r.alerts; state.alertCount = r.unseen; render();
+  }).catch(function (e) { setErr(e.message); });
+}
 function loadHome() {
   Promise.all([api("GET", "/api/dashboard"), api("GET", "/api/pods"), api("GET", "/api/people")])
     .then(function (r) { state.dash = r[0]; state.pods = r[1].pods; state.people = r[2].people; render(); })
@@ -159,6 +173,10 @@ function loadPod(id, tab) {
       api("GET", "/api/pods/" + id + "/inbox").then(function (r) {
         state.inbox = r; state.inboxLoading = false; render();
       }).catch(function (e) { state.inbox = { items: [], error: e.message }; state.inboxLoading = false; render(); });
+    } else if (tab === "objectives") {
+      api("GET", "/api/pods/" + id + "/objectives").then(function (r) {
+        state.objectives = r.objectives; render();
+      }).catch(function (e) { setErr(e.message); });
     }
     render();
   }).catch(function (e) { setErr(e.message); });
@@ -167,7 +185,8 @@ function loadTimeTab() {
   var pid = state.timePerson || (state.members[0] && state.members[0].person_id);
   state.timePerson = pid;
   if (!pid) { state.entries = []; render(); return; }
-  var from = state.timeWeek, to = addDays(state.timeWeek, 6);
+  var weeksBack = state.valueLog ? 3 : 0;
+  var from = addDays(state.timeWeek, -7 * weeksBack), to = addDays(state.timeWeek, 6);
   api("GET", "/api/time?person_id=" + pid + "&from=" + from + "&to=" + to)
     .then(function (r) { state.entries = r.entries; render(); })
     .catch(function (e) { setErr(e.message); });
@@ -272,13 +291,22 @@ function loadSettings() {
 }
 
 /* ---------- chrome ---------- */
+function alertBellInner() {
+  var n = state.alertCount || 0;
+  var badge = n ? '<span class="bell-badge">' + (n > 99 ? "99+" : n) + '</span>' : '';
+  return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>' + badge;
+}
+function alertBellHtml() {
+  var n = state.alertCount || 0;
+  return '<a href="#/alerts" class="alert-bell" title="Alerts" aria-label="Alerts' + (n ? ", " + n + " unread" : "") + '">' + alertBellInner() + '</a>';
+}
 function renderSidebar() {
   var pods = state.pods.map(function (p) {
     return '<a class="nav-item' + (state.pod && state.pod.id === p.id ? " active" : "") + '" href="#/pod/' + p.id + '/channels">' +
       '<span class="dot" style="background:' + esc(p.color) + '"></span>' + esc(p.name) +
       '<span class="nav-count">' + p.members + '</span></a>';
   }).join("");
-  return '<div class="brand">Podium<span>.</span></div>' +
+  return '<div class="brand">Podium<span>.</span>' + alertBellHtml() + '</div>' +
     '<div class="nav-sec">Firm</div>' +
     '<a class="nav-item" href="#/home">Dashboard</a>' +
     '<a class="nav-item" href="#/pipeline">Pipeline</a>' +
@@ -353,7 +381,7 @@ function viewPods(pods) {
 }
 
 function viewPodHead(pod, tab, members, retainer, timers) {
-  var tabs = [["channels", "Channels"], ["pages", "Pages"], ["time", "Time"], ["tasks", "Tasks"], ["inbox", "Inbox"]].map(function (t) {
+  var tabs = [["channels", "Channels"], ["pages", "Pages"], ["time", "Time"], ["tasks", "Tasks"], ["inbox", "Inbox"], ["objectives", "Objectives"]].map(function (t) {
     return '<div class="tab' + (tab === t[0] ? " active" : "") + '" onclick="location.hash=\'#/pod/' + pod.id + '/' + t[0] + '\'">' + t[1] + "</div>";
   }).join("");
   var mem = members.map(function (m) {
@@ -441,7 +469,7 @@ function viewPages(pages, editing, page, templates, showTemplateForm) {
       '<span class="sub">' + timeAgo(page.updated_at) + (page.updated_by ? ' · ' + esc(page.updated_by) : '') + '</span>' +
       '<span style="flex:1"></span><button class="btn small ghost" onclick="Podium.editPage()">Edit</button> ' +
       '<button class="btn small ghost" onclick="Podium.closePage()">All pages</button></div>' +
-      '<div class="msg-body">' + md(page.body_md) + '</div></div>';
+      '<div class="msg-body">' + md(page.body_md) + '</div>' + viewSigningBanner(page, state.signing) + '</div>';
   } else {
     var tform = "";
     if (showTemplateForm && templates.length) {
@@ -486,12 +514,16 @@ function viewTimeTab(pod, members, people, personId, week, entries) {
   var list = entries.map(function (e) {
     return '<tr><td>' + esc(e.day) + '</td><td>' + esc(e.pod_name || "") + '</td><td class="num">' + fmtHours(e.hours) + '</td>' +
       '<td>' + (e.billable ? '<span class="pill billable">billable</span>' : '<span class="pill nonbill">non-billable</span>') + '</td>' +
+      '<td>' + blockPill(e.block_type) + '</td>' +
       '<td>' + esc(e.note || "") + '</td>' +
       '<td><button class="link-btn" onclick="Podium.editEntry(\'' + e.id + '\')">Edit</button> ' +
       '<button class="link-btn" onclick="Podium.deleteEntry(\'' + e.id + '\')">Delete</button></td></tr>';
   }).join("");
-  return '<div class="card"><h3>Time — week of ' + esc(week) + '</h3>' +
-    '<div class="form-row" style="margin-bottom:10px;max-width:420px"><div><label>Person</label>' +
+  return '<div class="card"><div class="row between"><h3 style="margin:0">Time — week of ' + esc(week) + '</h3>' +
+    '<div class="seg-toggle"><button class="' + (state.valueLog ? "" : "active") + '" onclick="Podium.toggleValueLog(false)">Timesheet</button>' +
+    '<button class="' + (state.valueLog ? "active" : "") + '" onclick="Podium.toggleValueLog(true)">Value log</button></div></div>' +
+    (state.valueLog ? viewValueLog(entries) :
+    '<div class="form-row" style="margin-bottom:10px;max-width:420px;margin-top:12px"><div><label>Person</label>' +
     '<select id="time-person" onchange="Podium.switchTimePerson(this.value)">' + opts + '</select></div>' +
     '<div><label>Week</label><input type="date" id="time-week" value="' + esc(week) + '" onchange="Podium.switchTimeWeek(this.value)"></div></div>' +
     '<div class="time-grid"><table class="tg-table"><tr><th>Pod</th>' + head + '</tr>' + (rows || '<tr><td colspan="8" class="muted">No pods</td></tr>') + '</table></div>' +
@@ -501,10 +533,46 @@ function viewTimeTab(pod, members, people, personId, week, entries) {
     '<div><label>Day</label><input type="date" name="day" id="entry-day" value="' + esc(todayIso()) + '" required></div>' +
     '<div><label>Hours</label><input type="number" name="hours" id="entry-hours" step="0.25" min="0.25" max="24" required placeholder="4"></div>' +
     '<div><label>Billable</label><select name="billable" id="entry-billable"><option value="1">Billable</option><option value="0">Non-billable</option></select></div>' +
+    '<div><label>Block type</label><select name="block_type" id="entry-block">' +
+    '<option value="hours">Hours</option><option value="advisory">Advisory block</option>' +
+    '<option value="sprint">Sprint (0.5-day)</option><option value="milestone">Milestone</option></select></div>' +
     '</div><label>Note</label><input name="note" id="entry-note" placeholder="What was this for?" maxlength="200">' +
+    '<label>Key decisions / assets <span class="muted">— one per line</span></label>' +
+    '<textarea name="decisions" id="entry-decisions" rows="2" maxlength="2000" placeholder="Approved the pricing change&#10;Shipped the onboarding flow"></textarea>' +
     '<div style="margin-top:10px"><button class="btn" type="submit">Save entry</button> <button class="btn ghost" type="button" onclick="Podium.resetEntryForm()">Clear</button></div></form></div>' +
-    '<div class="card"><h3>Entries</h3><table><tr><th>Day</th><th>Pod</th><th class="num">Hours</th><th>Type</th><th>Note</th><th></th></tr>' +
-    (list || '<tr><td colspan="6" class="muted">No entries this week.</td></tr>') + '</table></div>';
+    '<div class="card"><h3>Entries</h3><table><tr><th>Day</th><th>Pod</th><th class="num">Hours</th><th>Type</th><th>Block</th><th>Note</th><th></th></tr>' +
+    (list || '<tr><td colspan="7" class="muted">No entries this week.</td></tr>') + '</table></div>');
+}
+
+/* Value log: the "value delivered" narrative — entries grouped by week with
+   block-type pills and decision bullets. This is what the client sees. */
+function blockPill(b) {
+  var labels = { hours: "Hours", advisory: "Advisory", sprint: "Sprint", milestone: "Milestone" };
+  return '<span class="pill block-' + esc(b || "hours") + '">' + esc(labels[b] || "Hours") + '</span>';
+}
+function viewValueLog(entries) {
+  entries = entries || [];
+  var weeks = {};
+  entries.forEach(function (e) {
+    var d = new Date(e.day + "T12:00:00");
+    var monday = addDays(e.day, -((d.getDay() + 6) % 7));
+    (weeks[monday] = weeks[monday] || []).push(e);
+  });
+  var keys = Object.keys(weeks).sort().reverse();
+  var html = keys.map(function (w) {
+    var items = weeks[w].map(function (e) {
+      var bullets = String(e.decisions || "").split("\n").map(function (s) { return s.trim(); }).filter(Boolean);
+      var dec = bullets.length ? '<ul class="dec-list">' + bullets.map(function (b) { return "<li>" + esc(b) + "</li>"; }).join("") + "</ul>" : "";
+      return '<div class="vl-item"><div class="row between"><div>' + blockPill(e.block_type) +
+        ' <b>' + fmtHours(e.hours) + '</b> <span class="muted">' + esc(e.day) + ' · ' + esc(e.pod_name || "") + '</span></div>' +
+        '<button class="link-btn" onclick="Podium.editEntry(\'' + e.id + '\')">Edit</button></div>' +
+        (e.note ? '<div>' + esc(e.note) + '</div>' : "") + dec + '</div>';
+    }).join("");
+    var tot = weeks[w].reduce(function (s, e) { return s + Number(e.hours); }, 0);
+    return '<div class="card"><div class="row between"><h3 style="margin:0">Week of ' + esc(w) + '</h3>' +
+      '<span class="muted">' + fmtHours(tot) + ' total</span></div>' + items + '</div>';
+  }).join("");
+  return '<div style="margin-top:12px">' + (html || '<div class="card"><div class="empty">No logged value in this range yet.</div></div>') + '</div>';
 }
 
 function viewPeople(people, weekHours) {
@@ -1022,9 +1090,20 @@ function viewTimerWidget(pod, members, timers) {
   if (running) {
     var el = running.elapsed_sec || 0;
     var mm = Math.floor(el / 60), ss = el % 60;
+    var stopRow;
+    if (state.stopTimerFor === running.person_id) {
+      stopRow = '<div class="stop-confirm"><div class="form-row"><div><label>Block type</label><select id="stop-block">' +
+        '<option value="hours">Hours</option><option value="advisory">Advisory block</option>' +
+        '<option value="sprint">Sprint (0.5-day)</option><option value="milestone">Milestone</option></select></div></div>' +
+        '<label>Key decisions / assets <span class="muted">— one per line</span></label>' +
+        '<textarea id="stop-decisions" rows="2" maxlength="2000" placeholder="What got decided or shipped?"></textarea>' +
+        '<div style="margin-top:8px;display:flex;gap:8px"><button class="btn small" onclick="Podium.confirmStopTimer(\'' + running.person_id + '\')">Log time</button>' +
+        '<button class="btn small ghost" onclick="Podium.cancelStopTimer()">Back</button></div></div>';
+    } else {
+      stopRow = '<button class="btn small danger" onclick="Podium.stopTimer(\'' + running.person_id + '\')">Stop</button>';
+    }
     inner = '<div class="timer-running"><span class="pulse"></span><b>' + esc(running.person_name || "Timer") + '</b>' +
-      '<span class="timer-el">' + mm + ':' + String(ss).padStart(2, "0") + '</span>' +
-      '<button class="btn small danger" onclick="Podium.stopTimer(\'' + running.person_id + '\')">Stop</button></div>';
+      '<span class="timer-el">' + mm + ':' + String(ss).padStart(2, "0") + '</span>' + stopRow + '</div>';
   } else {
     inner = '<div class="timer-idle"><select id="timer-person">' + opts + '</select>' +
       '<input id="timer-note" placeholder="What are you working on?" maxlength="200">' +
@@ -1096,6 +1175,85 @@ function viewInbox(pod, inbox, loading) {
   return head + stamp + (rows || '<div class="card"><div class="empty">No recent email with pod members.</div></div>');
 }
 
+/* ---------- objectives & key results ---------- */
+function objStatusPill(s) {
+  var cls = s === "done" ? "open" : s === "at_risk" ? "closed" : "billable";
+  var label = s === "on_track" ? "On track" : s === "at_risk" ? "At risk" : "Done";
+  return '<span class="pill ' + cls + '">' + label + '</span>';
+}
+function viewObjectives(pod, objectives) {
+  objectives = objectives || [];
+  var cards = objectives.map(function (o) {
+    var krs = (o.key_results || []).map(function (k) {
+      return '<div class="kr-row"><div class="kr-main"><b>' + esc(k.title) + '</b>' +
+        '<div class="muted">' + esc(k.current || "—") + (k.target ? ' <span class="muted">/ target ' + esc(k.target) + '</span>' : '') + '</div></div>' +
+        '<button class="link-btn" onclick="Podium.editKeyResult(\'' + k.id + '\',\'' + esc(k.title) + '\',\'' + esc(k.current) + '\',\'' + esc(k.target) + '\')">Edit</button> ' +
+        '<button class="link-btn" onclick="Podium.deleteKeyResult(\'' + k.id + '\')">Delete</button></div>';
+    }).join("");
+    var bar = '<div class="bar-track"><div class="bar-fill obj-fill" style="width:' + o.progress_pct + '%"></div></div>';
+    return '<div class="card obj-card"><div class="row between"><div><h3 style="margin:0">' + esc(o.title) + '</h3>' +
+      '<div class="muted">' + esc(o.period || "no period") + '</div></div>' + objStatusPill(o.status) + '</div>' +
+      '<div class="bar-row" style="margin:12px 0 4px">' + bar + '<div class="bar-val">' + o.progress_pct + '%</div></div>' +
+      '<form class="obj-progress" onsubmit="return Podium.saveObjectiveProgress(event,\'' + o.id + '\')">' +
+      '<input type="range" name="progress_pct" min="0" max="100" value="' + o.progress_pct + '" oninput="this.nextElementSibling.value=this.value+\'%\'">' +
+      '<output>' + o.progress_pct + '%</output> ' +
+      '<select name="status"><option value="on_track"' + (o.status === "on_track" ? " selected" : "") + '>On track</option>' +
+      '<option value="at_risk"' + (o.status === "at_risk" ? " selected" : "") + '>At risk</option>' +
+      '<option value="done"' + (o.status === "done" ? " selected" : "") + '>Done</option></select> ' +
+      '<button class="btn small" type="submit">Update</button> ' +
+      '<button class="link-btn" type="button" onclick="Podium.deleteObjective(\'' + o.id + '\')">Delete</button></form>' +
+      '<div class="kr-list">' + (krs || '<div class="muted">No key results yet.</div>') + '</div>' +
+      '<form class="kr-add" onsubmit="return Podium.saveKeyResult(event,\'' + o.id + '\')">' +
+      '<input name="title" placeholder="Key result…" required maxlength="200"> ' +
+      '<input name="current" placeholder="Current" maxlength="200" style="max-width:140px"> ' +
+      '<input name="target" placeholder="Target" maxlength="200" style="max-width:140px"> ' +
+      '<button class="btn small ghost" type="submit">+ KR</button></form></div>';
+  }).join("");
+  return '<div class="view-head"><h1>Objectives</h1><span class="sub">Value delivered, not hours worked</span></div>' + flash() +
+    (cards || '<div class="card"><div class="empty">No objectives yet — set the pod\'s quarterly bets.</div></div>') +
+    '<div class="card"><h3>New objective</h3><form onsubmit="return Podium.saveObjective(event,\'' + pod.id + '\')">' +
+    '<div class="form-row"><div><label>Title</label><input name="title" required maxlength="200" placeholder="e.g. Cut monthly burn below $180k"></div>' +
+    '<div style="max-width:140px"><label>Period</label><input name="period" placeholder="2026-Q4" maxlength="12"></div></div>' +
+    '<div style="margin-top:10px"><button class="btn" type="submit">Add objective</button></div></form></div>';
+}
+
+/* ---------- scope-drift alerts ---------- */
+function viewAlerts(alerts) {
+  alerts = alerts || [];
+  var rows = alerts.map(function (a) {
+    return '<div class="card alert-card' + (a.seen ? "" : " alert-unseen") + '">' +
+      '<div class="row between"><b>' + esc(a.pod_name || "Pod") + '</b>' +
+      '<span class="muted">' + esc(timeAgo(a.created_at)) + '</span></div>' +
+      '<div style="margin:8px 0">' + esc(a.message) + '</div>' +
+      (a.seen ? '<span class="muted">Seen</span>'
+        : '<button class="btn small ghost" onclick="Podium.markAlertSeen(\'' + a.id + '\')">Mark seen</button>') +
+      '</div>';
+  }).join("");
+  return '<div class="view-head"><h1>Alerts</h1><span class="sub">Scope drift & retainer warnings</span></div>' + flash() +
+    (rows || '<div class="card"><div class="empty">All quiet — no alerts.</div></div>');
+}
+
+/* ---------- page signing banner ---------- */
+function viewSigningBanner(page, signing) {
+  if (!signing) {
+    return '<div style="margin-top:12px"><button class="btn small ghost" onclick="Podium.showSigningForm()">Send for signature</button></div>' +
+      (state.showSigningForm ?
+        '<form class="card" style="margin-top:10px;background:var(--paper)" onsubmit="return Podium.createSigning(event,\'' + page.id + '\')">' +
+        '<h3 style="margin-top:0">Send for signature</h3>' +
+        '<div class="form-row"><div><label>Signer name</label><input name="signer_name" required maxlength="120" placeholder="Client name"></div>' +
+        '<div><label>Signer email</label><input name="signer_email" type="email" required maxlength="160" placeholder="client@company.com"></div></div>' +
+        '<div style="margin-top:10px;display:flex;gap:8px"><button class="btn small" type="submit">Create signing link</button>' +
+        '<button class="btn small ghost" type="button" onclick="Podium.showSigningForm(false)">Cancel</button></div></form>' : '');
+  }
+  if (signing.status === "signed") {
+    return '<div class="sign-banner signed"><b>Signed</b> by ' + esc(signing.signer_name) + ' · ' + esc(timeAgo(signing.signed_at)) +
+      '<div class="muted mono">hash ' + esc((signing.signature_hash || "").slice(0, 16)) + '…</div></div>';
+  }
+  return '<div class="sign-banner pending"><b>Awaiting signature</b> — ' + esc(signing.signer_name) + ' &lt;' + esc(signing.signer_email) + '&gt;' +
+    '<div class="muted">Signing link: <a href="/sign/' + esc(signing.token) + '">/sign/' + esc(signing.token).slice(0, 12) + '…</a></div>' +
+    '<div style="margin-top:8px"><button class="link-btn" onclick="Podium.revokeSigning(\'' + page.id + '\')">Revoke</button></div></div>';
+}
+
 /* ---------- render orchestration ---------- */
 function currentView() {  var h = (location.hash || "#/home").replace(/^#/, "");
   return (h.split("/").filter(Boolean)[0] || "home");
@@ -1104,6 +1262,8 @@ function render() {
   var v = currentView();
   var parts = currentViewParts();
   document.getElementById("sidebar").innerHTML = renderSidebar();
+  var abf = document.getElementById("alertbell-float");
+  if (abf && abf.style) { abf.innerHTML = alertBellInner(); abf.style.display = ""; }
   document.querySelectorAll("#bottomnav a").forEach(function (a) {
     a.classList.toggle("active", a.getAttribute("data-v") === v || (v === "pod" && a.getAttribute("data-v") === "pods"));
   });
@@ -1118,6 +1278,7 @@ function render() {
     else if (tab === "time") el.innerHTML = head + viewTimeTab(state.pod, state.members, state.people, state.timePerson, state.timeWeek, state.entries);
     else if (tab === "tasks") el.innerHTML = head + viewTasks(state.pod, state.tasks, state.tasksErr);
     else if (tab === "inbox") el.innerHTML = head + viewInbox(state.pod, state.inbox, state.inboxLoading);
+    else if (tab === "objectives") el.innerHTML = head + viewObjectives(state.pod, state.objectives);
     fillMemberPicker();
   }
   else if (v === "people") el.innerHTML = viewPeople(state.people, state.weekHours || {});
@@ -1128,6 +1289,7 @@ function render() {
   else if (v === "schedule") el.innerHTML = viewSchedule({ bookings: state.bookings, people: state.people, availability: state.availability });
   else if (v === "invoices") el.innerHTML = viewInvoices(state.invoices, state.invoice, state.pods);
   else if (v === "settings") el.innerHTML = viewSettings(state.settings, state.templates);
+  else if (v === "alerts") el.innerHTML = viewAlerts(state.alerts);
   else el.innerHTML = viewHome(state.dash);
   if (state.editingPage) Podium.previewPage();
   labelTables(document.getElementById("view"));
@@ -1177,6 +1339,8 @@ var Podium = {
   viewTasks: viewTasks, viewInbox: viewInbox, labelTables: labelTables, timeAgo: timeAgo,
   viewTalent: viewTalent, viewBuilder: viewBuilder, viewMatchPortal: viewMatchPortal,
   freshBuilder: freshBuilder, talentLoadClass: talentLoadClass,
+  viewObjectives: viewObjectives, viewAlerts: viewAlerts, viewValueLog: viewValueLog,
+  viewSigningBanner: viewSigningBanner, blockPill: blockPill,
 
   createPod: function (e) {
     e.preventDefault();
@@ -1235,7 +1399,12 @@ var Podium = {
     return false;
   },
   openPage: function (id) {
-    api("GET", "/api/pages/" + id).then(function (r) { state.page = r.page; state.editingPage = false; render(); });
+    Promise.all([
+      api("GET", "/api/pages/" + id),
+      api("GET", "/api/pages/" + id + "/signing"),
+    ]).then(function (r) {
+      state.page = r[0].page; state.signing = r[1].signing; state.showSigningForm = false; state.editingPage = false; render();
+    }).catch(function (e) { setErr(e.message); });
   },
   closePage: function () { state.page = null; state.editingPage = false; render(); },
   newPage: function () { state.page = null; state.editingPage = true; render(); },
@@ -1273,14 +1442,18 @@ var Podium = {
     document.getElementById("entry-day").value = todayIso();
     document.getElementById("entry-hours").value = "";
     document.getElementById("entry-note").value = "";
+    document.getElementById("entry-block").value = "hours";
+    document.getElementById("entry-decisions").value = "";
   },
   saveEntry: function (e) {
     e.preventDefault();
     var f = e.target, id = f.id.value;
-    var body = { pod_id: state.pod.id, person_id: state.timePerson, day: f.day.value, hours: Number(f.hours.value), note: f.note.value, billable: Number(f.billable.value) };
+    var body = { pod_id: state.pod.id, person_id: state.timePerson, day: f.day.value, hours: Number(f.hours.value), note: f.note.value, billable: Number(f.billable.value), block_type: f.block_type.value, decisions: f.decisions.value };
     var p = id ? api("PUT", "/api/time/" + id, body) : api("POST", "/api/time", body);
-    p.then(function () { Podium.resetEntryForm(); loadTimeTab(); setOk("Time saved."); })
-      .catch(function (er) { setErr(er.message); });
+    p.then(function (r) {
+      Podium.resetEntryForm(); loadTimeTab();
+      setOk("Time saved." + (r && r.alert ? " Scope alert: " + r.alert.kind + "." : ""));
+    }).catch(function (er) { setErr(er.message); });
     return false;
   },
   editEntry: function (id) {
@@ -1291,7 +1464,13 @@ var Podium = {
     document.getElementById("entry-hours").value = e.hours;
     document.getElementById("entry-note").value = e.note || "";
     document.getElementById("entry-billable").value = String(e.billable);
+    document.getElementById("entry-block").value = e.block_type || "hours";
+    document.getElementById("entry-decisions").value = e.decisions || "";
     document.getElementById("entry-day").scrollIntoView({ block: "center" });
+  },
+  toggleValueLog: function (on) {
+    state.valueLog = on;
+    loadTimeTab();
   },
   deleteEntry: function (id) {
     if (!confirm("Delete this entry?")) return;
@@ -1533,8 +1712,26 @@ var Podium = {
       .catch(function (er) { setErr(er.message); });
   },
   stopTimer: function (personId) {
-    api("POST", "/api/timer/stop", { person_id: personId })
-      .then(function (r) { loadPod(state.pod.id, state.podTab || "channels"); setOk("Logged " + r.hours + "h."); })
+    state.stopTimerFor = personId;
+    render();
+    var d = document.getElementById("stop-decisions");
+    if (d) d.focus();
+  },
+  cancelStopTimer: function () {
+    state.stopTimerFor = null;
+    render();
+  },
+  confirmStopTimer: function (personId) {
+    var bt = document.getElementById("stop-block"), dc = document.getElementById("stop-decisions");
+    var body = { person_id: personId };
+    if (bt) body.block_type = bt.value;
+    if (dc) body.decisions = dc.value;
+    api("POST", "/api/timer/stop", body)
+      .then(function (r) {
+        state.stopTimerFor = null;
+        loadPod(state.pod.id, state.podTab || "channels");
+        setOk("Logged " + r.hours + "h." + (r.alert ? " Scope alert: " + r.alert.kind + "." : ""));
+      })
       .catch(function (er) { setErr(er.message); });
   },
   editBilling: function (podId) {
@@ -1702,6 +1899,85 @@ var Podium = {
         if (btn) btn.textContent = "Hide email";
       })
       .catch(function (er) { body.innerHTML = '<div class="err">' + er.message + '</div>'; body.style.display = "block"; });
+  },
+
+  /* ----- objectives & key results ----- */
+  saveObjective: function (e, podId) {
+    e.preventDefault();
+    var f = e.target;
+    api("POST", "/api/pods/" + podId + "/objectives", { title: f.title.value, period: f.period.value })
+      .then(function () { loadPod(podId, "objectives"); setOk("Objective added."); })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  saveObjectiveProgress: function (e, id) {
+    e.preventDefault();
+    var f = e.target;
+    api("PUT", "/api/objectives/" + id, { progress_pct: Number(f.progress_pct.value), status: f.status.value })
+      .then(function () { loadPod(state.pod.id, "objectives"); })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  deleteObjective: function (id) {
+    if (!confirm("Delete this objective and its key results?")) return;
+    api("DELETE", "/api/objectives/" + id)
+      .then(function () { loadPod(state.pod.id, "objectives"); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  saveKeyResult: function (e, objectiveId) {
+    e.preventDefault();
+    var f = e.target;
+    api("POST", "/api/objectives/" + objectiveId + "/key-results", { title: f.title.value, current: f.current.value, target: f.target.value })
+      .then(function () { loadPod(state.pod.id, "objectives"); })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  editKeyResult: function (id, title, current, target) {
+    var t = prompt("Key result", title);
+    if (t === null) return;
+    var c = prompt("Current value", current || "");
+    if (c === null) return;
+    var tg = prompt("Target value", target || "");
+    if (tg === null) return;
+    api("PUT", "/api/key-results/" + id, { title: t, current: c, target: tg })
+      .then(function () { loadPod(state.pod.id, "objectives"); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  deleteKeyResult: function (id) {
+    if (!confirm("Delete this key result?")) return;
+    api("DELETE", "/api/key-results/" + id)
+      .then(function () { loadPod(state.pod.id, "objectives"); })
+      .catch(function (er) { setErr(er.message); });
+  },
+
+  /* ----- alerts ----- */
+  markAlertSeen: function (id) {
+    api("POST", "/api/alerts/" + id + "/seen", {})
+      .then(function () { loadAlerts(); setOk("Marked seen."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+
+  /* ----- page signing ----- */
+  showSigningForm: function (on) {
+    state.showSigningForm = on === undefined ? true : on;
+    render();
+  },
+  createSigning: function (e, pageId) {
+    e.preventDefault();
+    var f = e.target;
+    api("POST", "/api/pages/" + pageId + "/signing", { signer_name: f.signer_name.value, signer_email: f.signer_email.value })
+      .then(function (r) {
+        state.signing = r.signing; state.showSigningForm = false; render();
+        setOk("Signing link created — share it with the client.");
+      })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  revokeSigning: function (pageId) {
+    if (!confirm("Revoke this signing link?")) return;
+    api("DELETE", "/api/pages/" + pageId + "/signing")
+      .then(function () { state.signing = null; render(); setOk("Signing revoked."); })
+      .catch(function (er) { setErr(er.message); });
   },
 };
 
