@@ -416,10 +416,7 @@ function viewPods(pods) {
     '</div><div style="margin-top:10px"><button class="btn" type="submit">Create pod</button></div></form></div>';
 }
 
-function viewPodHead(pod, tab, members, retainer, timers) {
-  var tabs = [["channels", "Channels"], ["pages", "Pages"], ["time", "Time"], ["tasks", "Tasks"], ["inbox", "Inbox"], ["objectives", "Objectives"]].map(function (t) {
-    return '<div class="tab' + (tab === t[0] ? " active" : "") + '" onclick="location.hash=\'#/pod/' + pod.id + '/' + t[0] + '\'">' + t[1] + "</div>";
-  }).join("");
+function podMembersInner(pod, members) {
   var mem = members.map(function (m) {
     return '<span class="pill" style="background:var(--sand);margin:2px 4px 2px 0" title="' + esc(m.role || "member") + '">' +
       esc(m.person_name) + ' <a href="#" onclick="return Podium.removeMember(\'' + pod.id + "','" + m.person_id + '\')" style="color:var(--muted);text-decoration:none" title="Remove">×</a></span>';
@@ -434,19 +431,38 @@ function viewPodHead(pod, tab, members, retainer, timers) {
     ? '<table class="alloc-table" style="margin-top:10px"><tr><th>Exec</th><th class="num">Hours / month</th></tr>' + allocRows + '</table>' +
       '<div class="muted small">Blank = even split of the retainer cap. Hourly pods count 0 unless set.</div>'
     : "";
-  var billing = (pod.billing_type === "retainer")
-    ? '<span class="pill billable">retainer' + (pod.retainer_hours ? ' · ' + fmtHours(pod.retainer_hours) + '/mo' : '') + '</span>'
-    : '<span class="pill nonbill">hourly</span>';
-  return '<div class="view-head"><span class="dot" style="background:' + esc(pod.color) + ';width:16px;height:16px"></span>' +
-    '<h1>' + esc(pod.name) + '</h1><span class="sub">' + esc(pod.client_name || "") + ' · ' + members.length + '/9 members</span> ' + billing +
-    '<span style="flex:1"></span><button class="link-btn" onclick="Podium.editBilling(\'' + pod.id + '\')">Billing</button></div>' + flash() +
-    viewRetainerBar(retainer) + viewTimerWidget(pod, members, timers) +
-    '<div class="card"><h3>Members</h3><div>' + (mem || '<span class="muted">No members yet — add the pod\'s execs below.</span>') + '</div>' + allocTable +
+  return '<div>' + (mem || '<span class="muted">No members yet — add the pod\'s execs below.</span>') + '</div>' + allocTable +
     '<form onsubmit="return Podium.addMember(event,\'' + pod.id + '\')" style="margin-top:10px"><div class="form-row">' +
     '<select name="person_id" id="member-picker" required></select>' +
     '<input name="role" placeholder="Role in pod (e.g. Lead)" maxlength="40">' +
-    '</div><div style="margin-top:10px"><button class="btn small" type="submit">Add member</button></div></form></div>' +
-    viewMatchPortal(pod) +
+    '</div><div style="margin-top:10px"><button class="btn small" type="submit">Add member</button></div></form>';
+}
+
+function closePodMenu() {
+  var pop = document.getElementById("pod-menu");
+  if (pop) pop.setAttribute("hidden", "");
+  var btn = document.querySelector(".menu-btn");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+function viewPodHead(pod, tab, members, retainer, timers) {
+  var tabs = [["channels", "Channels"], ["pages", "Pages"], ["time", "Time"], ["tasks", "Tasks"], ["inbox", "Inbox"], ["objectives", "Objectives"]].map(function (t) {
+    return '<div class="tab' + (tab === t[0] ? " active" : "") + '" onclick="location.hash=\'#/pod/' + pod.id + '/' + t[0] + '\'">' + t[1] + "</div>";
+  }).join("");
+  var billing = (pod.billing_type === "retainer")
+    ? '<span class="pill billable">retainer' + (pod.retainer_hours ? ' · ' + fmtHours(pod.retainer_hours) + '/mo' : '') + '</span>'
+    : '<span class="pill nonbill">hourly</span>';
+  var menu = '<div class="menu-wrap"><button class="menu-btn" type="button" onclick="return Podium.togglePodMenu(event)" ' +
+    'aria-label="Pod menu" aria-haspopup="true" aria-expanded="false" title="Pod menu">&#9776;</button>' +
+    '<div class="menu-pop" id="pod-menu" hidden>' +
+    '<div class="menu-sec"><h4>Members</h4>' + podMembersInner(pod, members) + '</div>' +
+    '<div class="menu-sec"><h4>Client match portal</h4>' + viewMatchPortal(pod) + '</div>' +
+    '</div></div>';
+  return '<div class="view-head"><span class="dot" style="background:' + esc(pod.color) + ';width:16px;height:16px"></span>' +
+    '<h1>' + esc(pod.name) + '</h1>' + menu +
+    '<span class="sub">' + esc(pod.client_name || "") + ' · ' + members.length + '/9 members</span> ' + billing +
+    '<span style="flex:1"></span><button class="link-btn" onclick="Podium.editBilling(\'' + pod.id + '\')">Billing</button></div>' + flash() +
+    viewRetainerBar(retainer) + viewTimerWidget(pod, members, timers) +
     '<div class="tabs">' + tabs + '</div>';
 }
 
@@ -785,7 +801,8 @@ function viewConflictsPanel(panel) {
 }
 /* client match portal card (lives on the pod view) */
 function viewMatchPortal(pod) {
-  var h = '<div class="card"><h3>Client match portal</h3>';
+  // Inner content only — rendered inside the pod header hamburger menu (or anywhere else).
+  var h = '';
   if (pod.match_visible && pod.match_slug) {
     var url = (typeof location !== "undefined" ? location.origin : "") + "/match/" + pod.match_slug;
     h += '<div class="muted small">Live — clients see anonymized profiles (no full names, emails, or dollar rates).</div>' +
@@ -799,7 +816,7 @@ function viewMatchPortal(pod) {
     '<textarea id="match-blurb" maxlength="500" rows="2" placeholder="e.g. Series A fintech — needs CFO + COO, ~30h/mo">' +
     esc(pod.match_blurb || "") + '</textarea></div>' +
     '<div style="margin-top:8px"><button class="btn small" onclick="Podium.enableMatchLink(\'' + pod.id + '\')">' +
-    (pod.match_visible ? "Update summary" : "Enable match link") + '</button></div></div>';
+    (pod.match_visible ? "Update summary" : "Enable match link") + '</button></div>';
   return h;
 }
 
@@ -1699,6 +1716,28 @@ var Podium = {
     try { document.execCommand("copy"); setOk("Link copied."); }
     catch (e) { setErr("Copy failed — select the link manually."); }
   },
+  togglePodMenu: function (e) {
+    if (e) { e.stopPropagation(); e.preventDefault(); }
+    var pop = document.getElementById("pod-menu");
+    if (!pop) return false;
+    var willOpen = pop.hasAttribute("hidden");
+    closePodMenu();
+    if (willOpen) {
+      pop.removeAttribute("hidden");
+      var btn = document.querySelector(".menu-btn");
+      if (btn) {
+        btn.setAttribute("aria-expanded", "true");
+        // mobile sheet: pin under the button; desktop CSS anchors it via absolute positioning
+        if (window.innerWidth < 720) {
+          var r = btn.getBoundingClientRect();
+          pop.style.top = Math.round(r.bottom + 8) + "px";
+        } else {
+          pop.style.top = "";
+        }
+      }
+    }
+    return false;
+  },
   createPeriod: function (e) {
     e.preventDefault();
     var f = e.target;
@@ -2115,6 +2154,19 @@ function pollTimers() {
 if (typeof window !== "undefined") {
   window.Podium = Podium;
   window.addEventListener("hashchange", route);
+  // close the pod header menu on outside click / escape
+  if (document.addEventListener) {
+    document.addEventListener("click", function (e) {
+      var pop = document.getElementById("pod-menu");
+      if (pop && !pop.hasAttribute("hidden")) {
+        var wrap = e.target && e.target.closest ? e.target.closest(".menu-wrap") : null;
+        if (!wrap) closePodMenu();
+      }
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") closePodMenu();
+    });
+  }
   // preload for sidebar + member picker
   Promise.all([api("GET", "/api/pods"), api("GET", "/api/people")]).then(function (r) {
     state.pods = r[0].pods; state.people = r[1].people;

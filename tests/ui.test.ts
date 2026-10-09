@@ -5,6 +5,7 @@ import { describe, test, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 
 const SRC = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
+const CSS = readFileSync(new URL("../public/styles.css", import.meta.url).pathname, "utf8");
 
 function boot(reduced: boolean) {
   const els: Record<string, any> = {};
@@ -106,6 +107,23 @@ describe("views render without throwing", () => {
       expect(c).toContain("<strong>pod</strong>");
       expect(c).toContain("Hi <em>there</em>");
       expect(c).toContain("Reply in thread");
+    });
+    test(`pod head hamburger menu (${tag})`, () => {
+      const h = P.viewPodHead(samplePod, "channels", sampleMembers);
+      // hamburger button next to the pod name, menu hidden by default
+      expect(h).toContain('class="menu-btn"');
+      expect(h).toContain('id="pod-menu" hidden');
+      expect(h).toContain("togglePodMenu");
+      // members + match portal live inside the menu, not as standalone cards
+      expect(h).toContain("<h4>Members</h4>");
+      expect(h).toContain("<h4>Client match portal</h4>");
+      expect(h).toContain("Ava Reyes");
+      expect(h).toContain("Enable match link");
+      expect(h).not.toContain("<h3>Members</h3>");
+      expect(h).not.toContain("<h3>Client match portal</h3>");
+      // stylesheet carries the dropdown chrome
+      expect(CSS).toContain(".menu-pop");
+      expect(CSS).toContain(".menu-btn");
     });
     test(`pages (${tag})`, () => {
       const h = P.viewPages(samplePages, false, null);

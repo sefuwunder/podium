@@ -70,6 +70,54 @@ body {
 .view-head h1 { font-size: 24px; margin: 0; letter-spacing: -0.5px; }
 .view-head .sub { color: var(--muted); font-size: 13px; }
 
+/* ---------- pod header hamburger menu ---------- */
+.menu-wrap { position: relative; display: inline-flex; }
+.menu-btn {
+  border: 1px solid var(--glass-border);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  backdrop-filter: blur(14px) saturate(1.15);
+  border-radius: 10px;
+  width: 34px; height: 34px;
+  font-size: 16px; line-height: 1;
+  color: var(--ink);
+  cursor: pointer;
+  padding: 0;
+}
+.menu-btn:hover { background: #ffffff; }
+/* mobile: full-width sheet pinned under the header button */
+.menu-pop {
+  position: fixed;
+  left: 12px; right: 12px;
+  z-index: 60;
+  max-height: 70vh;
+  overflow-y: auto;
+  background: rgba(255, 255, 255, 0.9);
+  -webkit-backdrop-filter: blur(20px) saturate(1.25);
+  backdrop-filter: blur(20px) saturate(1.25);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 50px rgba(43, 38, 32, 0.2);
+}
+@media (min-width: 720px) {
+  /* desktop: compact dropdown anchored to the button */
+  .menu-pop {
+    position: absolute;
+    left: 0; right: auto;
+    width: 400px;
+    top: calc(100% + 8px);
+  }
+}
+.menu-sec { padding: 14px 16px; }
+.menu-sec + .menu-sec { border-top: 1px solid var(--line); }
+.menu-sec h4 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+}
+
 /* ---------- cards & grids (glass) ---------- */
 .card {
   background: var(--glass);
