@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Book time — Podium</title>
+<style>
+  :root { --paper: #faf7f1; --card: #fff; --ink: #2b2620; --muted: #8a8175; --line: #e9e1d3; --terra: #c96f4a; --terra-dark: #a8552f; --radius: 14px; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; background: var(--paper); color: var(--ink); margin: 0; padding: 24px 16px 60px; }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 24px; letter-spacing: -0.5px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; margin-bottom: 16px; }
+  .days { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 12px; }
+  .day { flex: 0 0 auto; border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 8px 12px; cursor: pointer; text-align: center; font-size: 13px; }
+  .day b { display: block; font-size: 15px; }
+  .day.active { border-color: var(--terra); background: #fdf3ec; font-weight: 700; }
+  .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+  .slot { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 10px; cursor: pointer; text-align: center; font-size: 14px; font-variant-numeric: tabular-nums; }
+  .slot.active { border-color: var(--terra); background: #fdf3ec; font-weight: 700; }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin: 12px 0 4px; }
+  input, textarea { width: 100%; font-size: 15px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-family: inherit; }
+  input:focus, textarea:focus { outline: 2px solid var(--terra); outline-offset: -1px; }
+  .btn { display: inline-block; border: none; cursor: pointer; background: var(--terra); color: #fff; font-weight: 650; font-size: 16px; padding: 12px 24px; border-radius: 10px; width: 100%; margin-top: 14px; }
+  .btn:hover { background: var(--terra-dark); }
+  .btn:disabled { opacity: 0.5; }
+  .err { background: #fbeeea; color: #b0483a; padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 14px; }
+  .ok { text-align: center; padding: 40px 20px; }
+  .ok h2 { margin-bottom: 8px; }
+  .muted { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="who">Book time</h1>
+  <div class="sub" id="who-sub">30-minute intro call</div>
+  <div id="err"></div>
+  <div id="main"></div>
+</div>
+<script>
+(function () {
+"use strict";
+var slug = location.pathname.split("/")[2] || "";
+var state = { person: null, slots: [], day: null, slot: null };
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+function err(m) { document.getElementById("err").innerHTML = m ? '<div class="err">' + esc(m) + "</div>" : ""; }
+function dayLabel(iso) {
+  var d = new Date(iso + "T12:00:00");
+  return { dow: ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][d.getDay()], num: d.getDate() };
+}
+function render() {
+  var byDay = {};
+  state.slots.forEach(function (s) {
+    var d = s.start_at.slice(0, 10);
+    (byDay[d] = byDay[d] || []).push(s);
+  });
+  var days = Object.keys(byDay).sort();
+  if (!state.day || !byDay[state.day]) state.day = days[0] || null;
+  var dayBtns = days.map(function (d) {
+    var l = dayLabel(d);
+    return '<button class="day' + (d === state.day ? " active" : "") + '" data-day="' + d + '"><b>' + l.num + "</b>" + l.dow + "</button>";
+  }).join("");
+  var slotBtns = (byDay[state.day] || []).map(function (s) {
+    var t = s.start_at.slice(11, 16);
+    var active = state.slot && state.slot.start_at === s.start_at ? " active" : "";
+    return '<button class="slot' + active + '" data-start="' + s.start_at + '" data-end="' + s.end_at + '">' + t + "</button>";
+  }).join("");
+  document.getElementById("main").innerHTML =
+    '<div class="card"><h3 style="margin-top:0">Pick a day</h3><div class="days">' + (dayBtns || '<span class="muted">No availability in the next 14 days.</span>') + "</div>" +
+    (state.day ? "<h3>Pick a time</h3><div class='slots'>" + slotBtns + "</div>" : "") + "</div>" +
+    (state.slot ?
+      '<div class="card"><h3 style="margin-top:0">Your details</h3>' +
+      "<div class='muted'>" + esc(state.slot.start_at.replace("T", " ").slice(0, 16)) + " — 30 min</div>" +
+      '<form id="book-form"><label>Name</label><input name="name" required maxlength="80">' +
+      '<label>Email</label><input name="email" type="email" required maxlength="120">' +
+      '<label>What should we talk about? (optional)</label><textarea name="notes" rows="3" maxlength="500"></textarea>' +
+      '<button class="btn" type="submit">Confirm booking</button></form></div>' : "");
+  Array.prototype.forEach.call(document.querySelectorAll(".day"), function (b) {
+    b.addEventListener("click", function () { state.day = b.getAttribute("data-day"); state.slot = null; err(""); render(); });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll(".slot"), function (b) {
+    b.addEventListener("click", function () {
+      state.slot = { start_at: b.getAttribute("data-start"), end_at: b.getAttribute("data-end") };
+      err(""); render();
+      var f = document.getElementById("book-form");
+      if (f) f.addEventListener("submit", submit);
+    });
+  });
+  var f = document.getElementById("book-form");
+  if (f) f.addEventListener("submit", submit);
+}
+function submit(e) {
+  e.preventDefault();
+  var f = e.target;
+  var btn = f.querySelector(".btn"); btn.disabled = true;
+  fetch("/book/" + slug, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      start_at: state.slot.start_at, end_at: state.slot.end_at,
+      booker_name: f.name.value, booker_email: f.email.value, notes: f.notes.value,
+    }),
+  }).then(function (r) {
+    if (!r.ok) return r.json().then(function (j) { throw new Error(j.error || "booking failed"); });
+    return r.json();
+  }).then(function () {
+    document.getElementById("main").innerHTML = '<div class="card ok"><h2>You\'re booked.</h2><div class="muted">A confirmation is on its way. Talk soon.</div></div>';
+  }).catch(function (e2) { err(e2.message); btn.disabled = false; });
+}
+fetch("/book/" + slug + "/slots").then(function (r) {
+  if (!r.ok) throw new Error("This booking page doesn't exist.");
+  return r.json();
+}).then(function (j) {
+  state.person = j.person; state.slots = j.slots;
+  document.getElementById("who").textContent = "Book time with " + j.person.name;
+  document.getElementById("who-sub").textContent = (j.person.title || "Intro call") + " · 30 minutes";
+  render();
+}).catch(function (e) { err(e.message); });
+})();
+</script>
+</body>
+</html>

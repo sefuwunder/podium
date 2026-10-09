@@ -66,18 +66,76 @@ export function initDb() {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_statements_period ON pay_statements(period_id);
+
+    -- v1 integrations: CRM, templates, timers, scheduling, invoices, settings
+    CREATE TABLE IF NOT EXISTS leads (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, company TEXT NOT NULL DEFAULT '',
+      email TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
+      temperature TEXT NOT NULL DEFAULT 'warm', priority INTEGER NOT NULL DEFAULT 3,
+      value_cents INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL DEFAULT 'intro',
+      notes TEXT NOT NULL DEFAULT '', partner_id TEXT, booking_id TEXT, pod_id TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads(stage);
+    CREATE TABLE IF NOT EXISTS partners (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'other',
+      contact_name TEXT NOT NULL DEFAULT '', contact_email TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS templates (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'doc',
+      body_md TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS timers (
+      id TEXT PRIMARY KEY, person_id TEXT NOT NULL, pod_id TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS availability (
+      id TEXT PRIMARY KEY, person_id TEXT NOT NULL, weekday INTEGER NOT NULL,
+      start_min INTEGER NOT NULL, end_min INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS bookings (
+      id TEXT PRIMARY KEY, person_id TEXT NOT NULL, lead_id TEXT,
+      start_at TEXT NOT NULL, end_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'confirmed',
+      booker_name TEXT NOT NULL DEFAULT '', booker_email TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_bookings_person ON bookings(person_id, start_at);
+    CREATE TABLE IF NOT EXISTS invoices (
+      id TEXT PRIMARY KEY, number TEXT NOT NULL UNIQUE, pod_id TEXT NOT NULL,
+      period_start TEXT NOT NULL, period_end TEXT NOT NULL, line_items TEXT NOT NULL DEFAULT '[]',
+      hours REAL NOT NULL DEFAULT 0, amount_cents INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'draft', stripe_invoice_id TEXT, qbo_id TEXT,
+      due_at TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+    );
   `);
+  // Column migrations for existing installs (PRAGMA-style).
+  const ensureColumn = (table: string, name: string, ddl: string) => {
+    const cols = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (!cols.some((c) => c.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`);
+  };
+  ensureColumn("pods", "billing_type", "TEXT NOT NULL DEFAULT 'hourly'");
+  ensureColumn("pods", "retainer_hours", "REAL");
+  ensureColumn("pods", "retainer_rate_cents", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("pods", "slack_channel_id", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("pods", "stripe_customer_id", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("pods", "stripe_subscription_id", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("people", "booking_slug", "TEXT");
+  seedTemplates();
 }
 
 // ---------- people ----------
-export interface Person { id: string; name: string; email: string; title: string; hourly_rate_cents: number; created_at: string; }
+export interface Person { id: string; name: string; email: string; title: string; hourly_rate_cents: number; booking_slug: string | null; created_at: string; }
 export const listPeople = () => db.query("SELECT * FROM people ORDER BY name COLLATE NOCASE").all() as Person[];
 export const getPerson = (id: string) => (db.query("SELECT * FROM people WHERE id = ?").get(id) as Person) || null;
 export function createPerson(p: { name: string; email?: string; title?: string; hourly_rate_cents?: number }): Person {
   if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
   const rate = Math.round(Number(p.hourly_rate_cents) || 0);
   if (rate < 0) throw Object.assign(new Error("hourly_rate_cents must be >= 0"), { status: 400 });
-  const row: Person = { id: uid(), name: p.name.trim(), email: (p.email || "").trim(), title: (p.title || "").trim(), hourly_rate_cents: rate, created_at: nowIso() };
+  const row: Person = { id: uid(), name: p.name.trim(), email: (p.email || "").trim(), title: (p.title || "").trim(), hourly_rate_cents: rate, booking_slug: null, created_at: nowIso() };
   db.query("INSERT INTO people (id, name, email, title, hourly_rate_cents, created_at) VALUES (?, ?, ?, ?, ?, ?)")
     .run(row.id, row.name, row.email, row.title, row.hourly_rate_cents, row.created_at);
   return row;
@@ -99,12 +157,20 @@ export function deletePerson(id: string): boolean {
 }
 
 // ---------- pods ----------
-export interface Pod { id: string; name: string; client_name: string; color: string; created_at: string; }
+export interface Pod {
+  id: string; name: string; client_name: string; color: string; created_at: string;
+  billing_type: string; retainer_hours: number | null; retainer_rate_cents: number;
+  slack_channel_id: string; stripe_customer_id: string; stripe_subscription_id: string;
+}
 export const listPods = () => db.query("SELECT * FROM pods ORDER BY name COLLATE NOCASE").all() as Pod[];
 export const getPod = (id: string) => (db.query("SELECT * FROM pods WHERE id = ?").get(id) as Pod) || null;
 export function createPod(p: { name: string; client_name?: string; color?: string }): Pod {
   if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
-  const row: Pod = { id: uid(), name: p.name.trim(), client_name: (p.client_name || "").trim(), color: p.color || "#c96f4a", created_at: nowIso() };
+  const row: Pod = {
+    id: uid(), name: p.name.trim(), client_name: (p.client_name || "").trim(), color: p.color || "#c96f4a",
+    created_at: nowIso(), billing_type: "hourly", retainer_hours: null, retainer_rate_cents: 0,
+    slack_channel_id: "", stripe_customer_id: "", stripe_subscription_id: "",
+  };
   db.query("INSERT INTO pods (id, name, client_name, color, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(row.id, row.name, row.client_name, row.color, row.created_at);
   createChannel(row.id, "general"); // every pod opens with #general
@@ -123,6 +189,9 @@ export function deletePod(id: string): boolean {
   db.query("DELETE FROM pod_members WHERE pod_id = ?").run(id);
   db.query("DELETE FROM time_entries WHERE pod_id = ?").run(id);
   db.query("DELETE FROM pay_statements WHERE pod_id = ?").run(id);
+  db.query("DELETE FROM timers WHERE pod_id = ?").run(id);
+  db.query("DELETE FROM invoices WHERE pod_id = ?").run(id);
+  db.query("UPDATE leads SET pod_id = NULL WHERE pod_id = ?").run(id);
   return db.query("DELETE FROM pods WHERE id = ?").run(id).changes > 0;
 }
 
@@ -362,8 +431,7 @@ export function statementsCsv(periodId: string): string {
 }
 
 // ---------- dashboard ----------
-export function weekRange(dayIso?: string): { from: string; to: string } {
-  const d = dayIso && DAY_RE.test(dayIso) ? new Date(dayIso + "T12:00:00Z") : new Date();
+export function weekRange(dayIso?: string): { from: string; to: string } {  const d = dayIso && DAY_RE.test(dayIso) ? new Date(dayIso + "T12:00:00Z") : new Date();
   const dow = (d.getUTCDay() + 6) % 7; // Monday = 0
   const mon = new Date(d); mon.setUTCDate(d.getUTCDate() - dow);
   const sun = new Date(mon); sun.setUTCDate(mon.getUTCDate() + 6);
@@ -385,7 +453,10 @@ export function dashboard() {
          WHERE t.day >= ? AND t.day <= ? GROUP BY t.person_id ORDER BY hours DESC`
       ).all(per.start_day, per.end_day)
     : [];
-  return { week: { from, to }, hoursPerPod: perPod, openPeriod: per, openPeriodPerPerson: perPerson };
+  const retainers = listPods()
+    .filter((p) => p.billing_type === "retainer" && p.retainer_hours)
+    .map((p) => ({ pod_id: p.id, pod_name: p.name, color: p.color, ...retainerUsage(p.id)! }));
+  return { week: { from, to }, hoursPerPod: perPod, openPeriod: per, openPeriodPerPerson: perPerson, retainers, timers: activeTimers() };
 }
 
 // ---------- seed ----------
@@ -460,4 +531,665 @@ export function seed() {
   console.log("seeded Podium: 2 pods, 7 people, channels, messages, pages, time entries, 1 open period");
 }
 
+// ---------- settings (secrets stay server-side; GET masks them) ----------
+const SECRET_KEYS = new Set([
+  "stripe_test_secret", "stripe_live_secret", "stripe_webhook_secret",
+  "slack_bot_token", "qbo_client_secret", "qbo_refresh_token",
+]);
+export const KNOWN_SETTINGS = [
+  "stripe_mode", "stripe_test_publishable", "stripe_test_secret",
+  "stripe_live_publishable", "stripe_live_secret", "stripe_webhook_secret",
+  "slack_bot_token",
+  "qbo_client_id", "qbo_client_secret", "qbo_redirect_uri", "qbo_sandbox",
+  "qbo_realm_id", "qbo_refresh_token",
+];
+export function getSetting(key: string): string {
+  const r = db.query("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | null;
+  return r ? r.value : "";
+}
+export function setSetting(key: string, value: string): void {
+  db.query(
+    "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at"
+  ).run(key, String(value ?? ""), nowIso());
+}
+/** Masked view for the client: secrets come back as {set, preview} only. */
+export function publicSettings(): Record<string, { set: boolean; preview: string }> {
+  const rows = db.query("SELECT key, value FROM settings").all() as { key: string; value: string }[];
+  const map = new Map(rows.map((r) => [r.key, r.value]));
+  const out: Record<string, { set: boolean; preview: string }> = {};
+  for (const k of KNOWN_SETTINGS) {
+    const v = map.get(k) || "";
+    out[k] = SECRET_KEYS.has(k)
+      ? { set: !!v, preview: v ? "••••" + v.slice(-4) : "" }
+      : { set: !!v, preview: k === "stripe_mode" && !v ? "test" : v };
+  }
+  return out;
+}
+/** The Stripe secret for the currently selected mode. Empty = not connected. */
+export function activeStripeSecret(): string {
+  const mode = getSetting("stripe_mode") || "test";
+  return mode === "live" ? getSetting("stripe_live_secret") : getSetting("stripe_test_secret");
+}
+export function stripeMode(): string {
+  return getSetting("stripe_mode") || "test";
+}
+
+// ---------- CRM: partners ----------
+const PARTNER_KINDS = ["vc", "accelerator", "other"];
+export interface Partner { id: string; name: string; kind: string; contact_name: string; contact_email: string; notes: string; created_at: string; }
+export const listPartners = () => db.query("SELECT * FROM partners ORDER BY name COLLATE NOCASE").all() as Partner[];
+export const getPartner = (id: string) => (db.query("SELECT * FROM partners WHERE id = ?").get(id) as Partner) || null;
+export function createPartner(p: { name: string; kind?: string; contact_name?: string; contact_email?: string; notes?: string }): Partner {
+  if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
+  const kind = (p.kind || "other").toLowerCase();
+  if (!PARTNER_KINDS.includes(kind)) throw Object.assign(new Error("kind must be vc, accelerator, or other"), { status: 400 });
+  const row: Partner = {
+    id: uid(), name: p.name.trim(), kind,
+    contact_name: (p.contact_name || "").trim(), contact_email: (p.contact_email || "").trim(),
+    notes: (p.notes || "").trim(), created_at: nowIso(),
+  };
+  db.query("INSERT INTO partners (id, name, kind, contact_name, contact_email, notes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(row.id, row.name, row.kind, row.contact_name, row.contact_email, row.notes, row.created_at);
+  return row;
+}
+export function updatePartner(id: string, p: Partial<Partner>): Partner | null {
+  const cur = getPartner(id); if (!cur) return null;
+  const kind = (p.kind ?? cur.kind).toLowerCase();
+  if (!PARTNER_KINDS.includes(kind)) throw Object.assign(new Error("kind must be vc, accelerator, or other"), { status: 400 });
+  const row = {
+    name: (p.name ?? cur.name).trim() || cur.name, kind,
+    contact_name: (p.contact_name ?? cur.contact_name).trim(),
+    contact_email: (p.contact_email ?? cur.contact_email).trim(),
+    notes: (p.notes ?? cur.notes).trim(),
+  };
+  db.query("UPDATE partners SET name = ?, kind = ?, contact_name = ?, contact_email = ?, notes = ? WHERE id = ?")
+    .run(row.name, row.kind, row.contact_name, row.contact_email, row.notes, id);
+  return getPartner(id);
+}
+export function deletePartner(id: string): boolean {
+  db.query("UPDATE leads SET partner_id = NULL WHERE partner_id = ?").run(id);
+  return db.query("DELETE FROM partners WHERE id = ?").run(id).changes > 0;
+}
+
+// ---------- CRM: leads ----------
+export const LEAD_STAGES = ["intro", "diagnostic", "sow", "won", "lost"];
+export const STAGE_LABEL: Record<string, string> = {
+  intro: "Intro Call", diagnostic: "Diagnostic Pitch", sow: "SOW Sent", won: "Closed Won", lost: "Lost",
+};
+export const STAGE_PROB: Record<string, number> = { intro: 0.1, diagnostic: 0.3, sow: 0.6, won: 1, lost: 0 };
+const LEAD_TEMPS = ["hot", "warm", "cold"];
+export interface Lead {
+  id: string; name: string; company: string; email: string; phone: string; source: string;
+  temperature: string; priority: number; value_cents: number; stage: string; notes: string;
+  partner_id: string | null; booking_id: string | null; pod_id: string | null; created_at: string;
+  partner_name?: string; pod_name?: string;
+}
+function leadWithJoins(where: string, ...args: any[]): Lead[] {
+  return db.query(
+    `SELECT l.*, pt.name AS partner_name, po.name AS pod_name FROM leads l
+     LEFT JOIN partners pt ON pt.id = l.partner_id LEFT JOIN pods po ON po.id = l.pod_id
+     ${where} ORDER BY l.created_at DESC`
+  ).all(...args) as Lead[];
+}
+export const listLeads = (f: { stage?: string; temperature?: string } = {}) => {
+  const wh: string[] = []; const args: any[] = [];
+  if (f.stage) { wh.push("l.stage = ?"); args.push(f.stage); }
+  if (f.temperature) { wh.push("l.temperature = ?"); args.push(f.temperature); }
+  return leadWithJoins(wh.length ? "WHERE " + wh.join(" AND ") : "", ...args);
+};
+export const getLead = (id: string) => leadWithJoins("WHERE l.id = ?", id)[0] || null;
+/** Warm + hot leads, priority then value — the firm's Top 20. */
+export function topLeads(limit = 20): Lead[] {
+  return leadWithJoins("WHERE l.temperature IN ('hot','warm') AND l.stage NOT IN ('won','lost')", )
+    .sort((a, b) => a.priority - b.priority || b.value_cents - a.value_cents)
+    .slice(0, limit);
+}
+export function createLead(p: Partial<Lead> & { name: string }): Lead {
+  if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
+  const temperature = (p.temperature || "warm").toLowerCase();
+  if (!LEAD_TEMPS.includes(temperature)) throw Object.assign(new Error("temperature must be hot, warm, or cold"), { status: 400 });
+  const priority = Math.min(5, Math.max(1, Math.round(Number(p.priority) || 3)));
+  const value_cents = Math.max(0, Math.round(Number(p.value_cents) || 0));
+  const stage = (p.stage || "intro").toLowerCase();
+  if (!LEAD_STAGES.includes(stage)) throw Object.assign(new Error("unknown stage"), { status: 400 });
+  if (p.partner_id && !getPartner(p.partner_id)) throw Object.assign(new Error("partner not found"), { status: 404 });
+  const row = {
+    id: uid(), name: p.name.trim(), company: (p.company || "").trim(),
+    email: (p.email || "").trim(), phone: (p.phone || "").trim(), source: (p.source || "").trim(),
+    temperature, priority, value_cents, stage, notes: (p.notes || "").trim(),
+    partner_id: p.partner_id || null, booking_id: p.booking_id || null, pod_id: null as string | null,
+    created_at: nowIso(),
+  };
+  db.query(`INSERT INTO leads (id, name, company, email, phone, source, temperature, priority, value_cents, stage, notes, partner_id, booking_id, pod_id, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.id, row.name, row.company, row.email, row.phone, row.source, row.temperature, row.priority,
+      row.value_cents, row.stage, row.notes, row.partner_id, row.booking_id, row.pod_id, row.created_at);
+  return getLead(row.id)!;
+}
+export function updateLead(id: string, p: Partial<Lead>): Lead | null {
+  const cur = getLead(id); if (!cur) return null;
+  const temperature = (p.temperature ?? cur.temperature).toLowerCase();
+  if (!LEAD_TEMPS.includes(temperature)) throw Object.assign(new Error("temperature must be hot, warm, or cold"), { status: 400 });
+  const priority = p.priority == null ? cur.priority : Math.min(5, Math.max(1, Math.round(Number(p.priority) || 3)));
+  const value_cents = p.value_cents == null ? cur.value_cents : Math.max(0, Math.round(Number(p.value_cents) || 0));
+  const partner_id = p.partner_id === undefined ? cur.partner_id : (p.partner_id || null);
+  if (partner_id && !getPartner(partner_id)) throw Object.assign(new Error("partner not found"), { status: 404 });
+  const booking_id = p.booking_id === undefined ? cur.booking_id : (p.booking_id || null);
+  const row = {
+    name: (p.name ?? cur.name).trim() || cur.name, company: (p.company ?? cur.company).trim(),
+    email: (p.email ?? cur.email).trim(), phone: (p.phone ?? cur.phone).trim(),
+    source: (p.source ?? cur.source).trim(), temperature, priority, value_cents,
+    notes: (p.notes ?? cur.notes).trim(), partner_id, booking_id,
+  };
+  db.query(`UPDATE leads SET name = ?, company = ?, email = ?, phone = ?, source = ?, temperature = ?, priority = ?, value_cents = ?, notes = ?, partner_id = ?, booking_id = ? WHERE id = ?`)
+    .run(row.name, row.company, row.email, row.phone, row.source, row.temperature, row.priority,
+      row.value_cents, row.notes, row.partner_id, row.booking_id, id);
+  return getLead(id);
+}
+/**
+ * Stage machine: forward exactly one step, or to `lost` from anywhere.
+ * `won` and `lost` are terminal. Judgment call, documented in README.
+ */
+export function canMoveLead(from: string, to: string): boolean {
+  if (from === to) return true;
+  if (from === "won" || from === "lost") return false;
+  if (to === "lost") return true;
+  const order = ["intro", "diagnostic", "sow", "won"];
+  return order.indexOf(to) === order.indexOf(from) + 1;
+}
+export function moveLead(id: string, to: string): Lead {
+  const cur = getLead(id);
+  if (!cur) throw Object.assign(new Error("lead not found"), { status: 404 });
+  const stage = (to || "").toLowerCase();
+  if (!LEAD_STAGES.includes(stage)) throw Object.assign(new Error("unknown stage"), { status: 400 });
+  if (!canMoveLead(cur.stage, stage))
+    throw Object.assign(new Error(`cannot move from ${STAGE_LABEL[cur.stage]} to ${STAGE_LABEL[stage]}`), { status: 409 });
+  db.query("UPDATE leads SET stage = ? WHERE id = ?").run(stage, id);
+  return getLead(id)!;
+}
+/** The money loop: a won deal becomes a pod. */
+export function spinUpPod(leadId: string): { lead: Lead; pod: Pod } {
+  const lead = getLead(leadId);
+  if (!lead) throw Object.assign(new Error("lead not found"), { status: 404 });
+  if (lead.stage !== "won") throw Object.assign(new Error("only Closed Won deals can spin up a pod"), { status: 409 });
+  if (lead.pod_id) throw Object.assign(new Error("this deal already has a pod"), { status: 409 });
+  const pod = createPod({ name: lead.company || lead.name, client_name: lead.company || lead.name });
+  db.query("UPDATE leads SET pod_id = ? WHERE id = ?").run(pod.id, leadId);
+  return { lead: getLead(leadId)!, pod };
+}
+export function deleteLead(id: string): boolean {
+  return db.query("DELETE FROM leads WHERE id = ?").run(id).changes > 0;
+}
+export interface PipelineStage { stage: string; label: string; count: number; total_cents: number; weighted_cents: number; leads: Lead[]; }
+export function pipelineSummary(): PipelineStage[] {
+  const leads = listLeads();
+  return LEAD_STAGES.map((stage) => {
+    const ls = leads.filter((l) => l.stage === stage);
+    const total_cents = ls.reduce((a, l) => a + l.value_cents, 0);
+    return {
+      stage, label: STAGE_LABEL[stage], count: ls.length, total_cents,
+      weighted_cents: Math.round(total_cents * STAGE_PROB[stage]), leads: ls,
+    };
+  });
+}
+
+// ---------- templates & knowledge base ----------
+export interface Template { id: string; name: string; kind: string; body_md: string; created_at: string; }
+export const listTemplates = () => db.query("SELECT * FROM templates ORDER BY name COLLATE NOCASE").all() as Template[];
+export const getTemplate = (id: string) => (db.query("SELECT * FROM templates WHERE id = ?").get(id) as Template) || null;
+export function createTemplate(p: { name: string; kind?: string; body_md?: string }): Template {
+  if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
+  const row: Template = { id: uid(), name: p.name.trim(), kind: (p.kind || "doc").trim(), body_md: p.body_md || "", created_at: nowIso() };
+  db.query("INSERT INTO templates (id, name, kind, body_md, created_at) VALUES (?, ?, ?, ?, ?)")
+    .run(row.id, row.name, row.kind, row.body_md, row.created_at);
+  return row;
+}
+export function updateTemplate(id: string, p: Partial<Template>): Template | null {
+  const cur = getTemplate(id); if (!cur) return null;
+  const row = { name: (p.name ?? cur.name).trim() || cur.name, kind: (p.kind ?? cur.kind).trim(), body_md: p.body_md ?? cur.body_md };
+  db.query("UPDATE templates SET name = ?, kind = ?, body_md = ? WHERE id = ?").run(row.name, row.kind, row.body_md, id);
+  return getTemplate(id);
+}
+export function deleteTemplate(id: string): boolean {
+  return db.query("DELETE FROM templates WHERE id = ?").run(id).changes > 0;
+}
+/** Substitute {{variable}} placeholders. Unknown variables become "". */
+export function renderTemplate(body: string, vars: Record<string, string>): string {
+  return String(body || "").replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_m, k: string) => vars[k] ?? "");
+}
+export function pageFromTemplate(podId: string, templateId: string, vars: Record<string, string>, title?: string): Page {
+  const t = getTemplate(templateId);
+  if (!t) throw Object.assign(new Error("template not found"), { status: 404 });
+  return createPage(podId, {
+    title: (title || t.name).trim(),
+    body_md: renderTemplate(t.body_md, vars),
+    updated_by: vars.owner_name || "",
+  });
+}
+const TEMPLATE_SEED: { name: string; kind: string; body_md: string }[] = [
+  {
+    name: "Statement of Work", kind: "sow",
+    body_md: `# Statement of Work — {{client_name}}
+
+**Pod:** {{pod_name}}
+**Date:** {{date}}
+**Prepared by:** {{owner_name}}
+
+## Objectives
+- Objective 1: what success looks like
+- Objective 2: measurable outcome
+
+## Scope
+- In scope: ...
+- Out of scope: ...
+
+## Term & commercial
+- Monthly retainer hours: ...
+- Rate: ...
+- Term: ... months, auto-renewing
+
+## Out of scope
+Anything not listed above requires a change order.
+
+---
+*Signed:* ______________________  *Date:* __________`,
+  },
+  {
+    name: "Meeting Notes", kind: "notes",
+    body_md: `# Meeting Notes — {{client_name}}
+
+**Date:** {{date}}
+**Pod:** {{pod_name}}
+**Attendees:** {{owner_name}}, ...
+
+## Decisions
+- ...
+
+## Action items
+- [ ] Owner — task — due date
+
+## Next meeting
+...`,
+  },
+  {
+    name: "30-60-90 Day Roadmap", kind: "roadmap",
+    body_md: `# 30-60-90 Day Roadmap — {{client_name}}
+
+**Pod:** {{pod_name}} · **Kickoff:** {{date}} · **Owner:** {{owner_name}}
+
+## First 30 days — Learn
+- Goal: ...
+- Deliverable: ...
+
+## Days 31–60 — Build
+- Goal: ...
+- Deliverable: ...
+
+## Days 61–90 — Scale
+- Goal: ...
+- Deliverable: ...`,
+  },
+  {
+    name: "Deliverables Tracker", kind: "tracker",
+    body_md: `# Deliverables Tracker — {{client_name}}
+
+**Pod:** {{pod_name}} · **Updated:** {{date}}
+
+| Deliverable | Owner | Due | Status |
+|---|---|---|---|
+| ... | {{owner_name}} | ... | Not started |
+
+*Status values: Not started · In progress · Blocked · Done*`,
+  },
+];
+export function seedTemplates() {
+  if ((db.query("SELECT COUNT(*) AS n FROM templates").get() as any).n > 0) return;
+  for (const t of TEMPLATE_SEED) createTemplate(t);
+}
+
+// ---------- timers: the big green button ----------
+export interface Timer { id: string; person_id: string; pod_id: string; note: string; started_at: string; person_name?: string; pod_name?: string; }
+export const activeTimerFor = (personId: string) =>
+  (db.query("SELECT * FROM timers WHERE person_id = ? LIMIT 1").get(personId) as Timer) || null;
+export function activeTimers(): Timer[] {
+  return db.query(
+    `SELECT t.*, p.name AS person_name, po.name AS pod_name FROM timers t
+     LEFT JOIN people p ON p.id = t.person_id LEFT JOIN pods po ON po.id = t.pod_id
+     ORDER BY t.started_at`
+  ).all() as Timer[];
+}
+export function startTimer(p: { person_id: string; pod_id: string; note?: string }): Timer {
+  if (!getPerson(p.person_id)) throw Object.assign(new Error("person not found"), { status: 404 });
+  if (!getPod(p.pod_id)) throw Object.assign(new Error("pod not found"), { status: 404 });
+  if (!isMember(p.pod_id, p.person_id))
+    throw Object.assign(new Error("person is not a member of this pod"), { status: 400 });
+  if (activeTimerFor(p.person_id))
+    throw Object.assign(new Error("a timer is already running for this person"), { status: 409 });
+  const row: Timer = { id: uid(), person_id: p.person_id, pod_id: p.pod_id, note: (p.note || "").trim(), started_at: nowIso() };
+  db.query("INSERT INTO timers (id, person_id, pod_id, note, started_at) VALUES (?, ?, ?, ?, ?)")
+    .run(row.id, row.person_id, row.pod_id, row.note, row.started_at);
+  return row;
+}
+/** Billing increments: round UP to the nearest tenth of an hour, minimum 0.1h. */
+export function billableHours(elapsedSec: number): number {
+  return Math.max(0.1, Math.ceil((Math.max(0, elapsedSec) / 3600) * 10) / 10);
+}
+const localDay = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+export function stopTimer(personId: string): { timer: Timer; entry: TimeEntry; hours: number; elapsed_sec: number } {
+  const t = activeTimerFor(personId);
+  if (!t) throw Object.assign(new Error("no active timer for this person"), { status: 404 });
+  const elapsed_sec = Math.max(0, (Date.now() - new Date(t.started_at).getTime()) / 1000);
+  const hours = billableHours(elapsed_sec);
+  if (hours > 24) throw Object.assign(new Error("timer ran over 24h — log it manually"), { status: 400 });
+  const entry = createEntry({ person_id: t.person_id, pod_id: t.pod_id, day: localDay(new Date()), hours, note: t.note || "Timer" });
+  db.query("DELETE FROM timers WHERE id = ?").run(t.id);
+  return { timer: t, entry, hours, elapsed_sec: Math.round(elapsed_sec) };
+}
+
+// ---------- retainers ----------
+export function updatePodBilling(id: string, p: { billing_type?: string; retainer_hours?: number | null; retainer_rate_cents?: number }): Pod | null {
+  const cur = getPod(id); if (!cur) return null;
+  const billing_type = (p.billing_type ?? cur.billing_type).toLowerCase();
+  if (!["retainer", "hourly"].includes(billing_type))
+    throw Object.assign(new Error("billing_type must be retainer or hourly"), { status: 400 });
+  const retainer_hours = p.retainer_hours === undefined ? cur.retainer_hours
+    : (p.retainer_hours == null || p.retainer_hours === 0 ? null : Math.max(0, Number(p.retainer_hours) || 0) || null);
+  const retainer_rate_cents = p.retainer_rate_cents == null ? cur.retainer_rate_cents : Math.max(0, Math.round(Number(p.retainer_rate_cents) || 0));
+  db.query("UPDATE pods SET billing_type = ?, retainer_hours = ?, retainer_rate_cents = ? WHERE id = ?")
+    .run(billing_type, retainer_hours, retainer_rate_cents, id);
+  return getPod(id);
+}
+/** Month-to-date billable hours vs the retainer cap. */
+export function retainerUsage(podId: string): { hours: number; cap: number; pct: number } | null {
+  const pod = getPod(podId);
+  if (!pod || pod.billing_type !== "retainer" || !pod.retainer_hours) return null;
+  const d = new Date();
+  const monthStart = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+  const today = localDay(d);
+  const r = db.query(
+    "SELECT COALESCE(SUM(hours), 0) AS h FROM time_entries WHERE pod_id = ? AND billable = 1 AND day >= ? AND day <= ?"
+  ).get(podId, monthStart, today) as { h: number };
+  const hours = Math.round(r.h * 100) / 100;
+  return { hours, cap: pod.retainer_hours, pct: pod.retainer_hours > 0 ? hours / pod.retainer_hours : 0 };
+}
+
+// ---------- scheduling: availability & bookings ----------
+export interface Availability { id: string; person_id: string; weekday: number; start_min: number; end_min: number; }
+export function listAvailability(personId: string): Availability[] {
+  return db.query("SELECT * FROM availability WHERE person_id = ? ORDER BY weekday, start_min").all(personId) as Availability[];
+}
+export function setAvailability(p: { person_id: string; weekday: number; start_min: number; end_min: number }): Availability {
+  if (!getPerson(p.person_id)) throw Object.assign(new Error("person not found"), { status: 404 });
+  const weekday = Number(p.weekday);
+  const start_min = Number(p.start_min), end_min = Number(p.end_min);
+  if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6)
+    throw Object.assign(new Error("weekday must be 0-6"), { status: 400 });
+  if (!Number.isFinite(start_min) || !Number.isFinite(end_min) || start_min < 0 || end_min > 1440 || start_min >= end_min)
+    throw Object.assign(new Error("need 0 <= start_min < end_min <= 1440"), { status: 400 });
+  const row: Availability = { id: uid(), person_id: p.person_id, weekday, start_min: Math.floor(start_min), end_min: Math.floor(end_min) };
+  db.query("INSERT INTO availability (id, person_id, weekday, start_min, end_min) VALUES (?, ?, ?, ?, ?)")
+    .run(row.id, row.person_id, row.weekday, row.start_min, row.end_min);
+  return row;
+}
+export function deleteAvailability(id: string): boolean {
+  return db.query("DELETE FROM availability WHERE id = ?").run(id).changes > 0;
+}
+/** Public booking slug for a person — generated on demand, unique. */
+export function enableBookingSlug(personId: string): string {
+  const person = getPerson(personId);
+  if (!person) throw Object.assign(new Error("person not found"), { status: 404 });
+  if (person.booking_slug) return person.booking_slug;
+  const base = person.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "exec";
+  let slug = base, i = 2;
+  while ((db.query("SELECT 1 FROM people WHERE booking_slug = ?").get(slug))) slug = `${base}-${i++}`;
+  db.query("UPDATE people SET booking_slug = ? WHERE id = ?").run(slug, personId);
+  return slug;
+}
+export const getPersonBySlug = (slug: string) =>
+  (db.query("SELECT * FROM people WHERE booking_slug = ?").get(slug) as Person) || null;
+
+export interface Booking {
+  id: string; person_id: string; lead_id: string | null; start_at: string; end_at: string;
+  status: string; booker_name: string; booker_email: string; notes: string; created_at: string;
+  person_name?: string; lead_company?: string;
+}
+function bookingsWithJoins(where: string, ...args: any[]): Booking[] {
+  return db.query(
+    `SELECT b.*, p.name AS person_name, l.company AS lead_company FROM bookings b
+     LEFT JOIN people p ON p.id = b.person_id LEFT JOIN leads l ON l.id = b.lead_id
+     ${where} ORDER BY b.start_at`
+  ).all(...args) as Booking[];
+}
+export const listBookings = (f: { person_id?: string; from?: string } = {}) => {
+  const wh = ["b.status = 'confirmed'"]; const args: any[] = [];
+  if (f.person_id) { wh.push("b.person_id = ?"); args.push(f.person_id); }
+  if (f.from) { wh.push("b.start_at >= ?"); args.push(f.from); }
+  return bookingsWithJoins("WHERE " + wh.join(" AND "), ...args);
+};
+export const getBooking = (id: string) => bookingsWithJoins("WHERE b.id = ?", id)[0] || null;
+const SLOT_MIN = 30;
+function overlaps(personId: string, start_at: string, end_at: string, excludeId?: string): boolean {
+  const rows = db.query(
+    `SELECT 1 FROM bookings WHERE person_id = ? AND status = 'confirmed'
+     AND start_at < ? AND end_at > ? ${excludeId ? "AND id != ?" : ""} LIMIT 1`
+  ).all(personId, end_at, start_at, ...(excludeId ? [excludeId] : []));
+  return rows.length > 0;
+}
+function isoLocal(d: Date): string {
+  return `${localDay(d)}T${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:00`;
+}
+/** Parse a "YYYY-MM-DDTHH:mm:ss" string as local time (no TZ shift). */
+function parseNaive(s: string): Date {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(s || "");
+  if (!m) return new Date(NaN);
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0));
+}
+/** Next N days of free 30-min slots for a public booking page. */
+export function freeSlots(slug: string, days = 14): { person: Person; slots: { start_at: string; end_at: string }[] } {
+  const person = getPersonBySlug(slug);
+  if (!person) throw Object.assign(new Error("booking page not found"), { status: 404 });
+  const avail = listAvailability(person.id);
+  const booked = listBookings({ person_id: person.id });
+  const slots: { start_at: string; end_at: string }[] = [];
+  const now = new Date();
+  for (let d = 0; d < days; d++) {
+    const day = new Date(now); day.setDate(day.getDate() + d); day.setHours(0, 0, 0, 0);
+    const wd = day.getDay();
+    for (const a of avail.filter((x) => x.weekday === wd)) {
+      for (let m = a.start_min; m + SLOT_MIN <= a.end_min; m += SLOT_MIN) {
+        const s = new Date(day); s.setHours(0, m, 0, 0);
+        const e = new Date(s); e.setMinutes(e.getMinutes() + SLOT_MIN);
+        if (s <= now) continue; // no past slots
+        const start_at = isoLocal(s), end_at = isoLocal(e);
+        if (booked.some((b) => b.start_at < end_at && b.end_at > start_at)) continue;
+        slots.push({ start_at, end_at });
+      }
+    }
+  }
+  return { person, slots };
+}
+export function createBooking(p: {
+  person_id: string; start_at: string; end_at: string; booker_name: string;
+  booker_email?: string; notes?: string; lead_id?: string | null;
+}): Booking {
+  if (!getPerson(p.person_id)) throw Object.assign(new Error("person not found"), { status: 404 });
+  if (!p.booker_name?.trim()) throw Object.assign(new Error("booker name is required"), { status: 400 });
+  if (!p.start_at || !p.end_at || p.start_at >= p.end_at)
+    throw Object.assign(new Error("need start_at < end_at"), { status: 400 });
+  if (parseNaive(p.start_at).getTime() <= Date.now())
+    throw Object.assign(new Error("cannot book in the past"), { status: 400 });
+  if (overlaps(p.person_id, p.start_at, p.end_at))
+    throw Object.assign(new Error("that slot is already booked"), { status: 409 });
+  const lead_id = p.lead_id || null;
+  if (lead_id && !getLead(lead_id)) throw Object.assign(new Error("lead not found"), { status: 404 });
+  const row = {
+    id: uid(), person_id: p.person_id, lead_id, start_at: p.start_at, end_at: p.end_at, status: "confirmed",
+    booker_name: p.booker_name.trim(), booker_email: (p.booker_email || "").trim(),
+    notes: (p.notes || "").trim(), created_at: nowIso(),
+  };
+  db.query(`INSERT INTO bookings (id, person_id, lead_id, start_at, end_at, status, booker_name, booker_email, notes, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.id, row.person_id, row.lead_id, row.start_at, row.end_at, row.status, row.booker_name, row.booker_email, row.notes, row.created_at);
+  if (lead_id) db.query("UPDATE leads SET booking_id = ? WHERE id = ?").run(row.id, lead_id);
+  return getBooking(row.id)!;
+}
+/** Public booking: the slot must sit inside declared availability. */
+export function publicBook(slug: string, p: { start_at: string; end_at: string; booker_name: string; booker_email?: string; notes?: string }): Booking {
+  const person = getPersonBySlug(slug);
+  if (!person) throw Object.assign(new Error("booking page not found"), { status: 404 });
+  const s = parseNaive(p.start_at), e = parseNaive(p.end_at);
+  if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime()))
+    throw Object.assign(new Error("bad date format"), { status: 400 });
+  if (e.getTime() - s.getTime() !== SLOT_MIN * 60 * 1000)
+    throw Object.assign(new Error("bookings are 30 minutes"), { status: 400 });
+  const mins = s.getHours() * 60 + s.getMinutes();
+  const ok = listAvailability(person.id).some(
+    (a) => a.weekday === s.getDay() && mins >= a.start_min && mins + SLOT_MIN <= a.end_min
+  );
+  if (!ok) throw Object.assign(new Error("that slot is outside availability"), { status: 400 });
+  return createBooking({ person_id: person.id, ...p });
+}
+export function cancelBooking(id: string): Booking | null {
+  const b = getBooking(id); if (!b) return null;
+  db.query("UPDATE bookings SET status = 'cancelled' WHERE id = ?").run(id);
+  return getBooking(id);
+}
+export function linkBookingLead(bookingId: string, leadId: string | null): Booking | null {
+  const b = getBooking(bookingId); if (!b) return null;
+  if (leadId && !getLead(leadId)) throw Object.assign(new Error("lead not found"), { status: 404 });
+  db.query("UPDATE bookings SET lead_id = ? WHERE id = ?").run(leadId, bookingId);
+  if (b.lead_id) db.query("UPDATE leads SET booking_id = NULL WHERE id = ? AND booking_id = ?").run(b.lead_id, bookingId);
+  if (leadId) db.query("UPDATE leads SET booking_id = ? WHERE id = ?").run(bookingId, leadId);
+  return getBooking(bookingId);
+}
+
+// ---------- invoices ----------
+export interface LineItem { description?: string; person_id?: string; person_name?: string; hours?: number; rate_cents?: number; amount_cents: number; }
+export interface Invoice {
+  id: string; number: string; pod_id: string; period_start: string; period_end: string;
+  line_items: LineItem[]; hours: number; amount_cents: number; status: string;
+  stripe_invoice_id: string | null; qbo_id: string | null; due_at: string | null; created_at: string;
+  pod_name?: string; client_name?: string;
+}
+function invoiceRow(r: any): Invoice {
+  return { ...r, line_items: JSON.parse(r.line_items || "[]") };
+}
+export const listInvoices = () =>
+  (db.query(
+    `SELECT i.*, p.name AS pod_name, p.client_name FROM invoices i LEFT JOIN pods p ON p.id = i.pod_id ORDER BY i.created_at DESC`
+  ).all() as any[]).map(invoiceRow);
+export const getInvoice = (id: string) => {
+  const r = db.query(
+    `SELECT i.*, p.name AS pod_name, p.client_name FROM invoices i LEFT JOIN pods p ON p.id = i.pod_id WHERE i.id = ?`
+  ).get(id) as any;
+  return r ? invoiceRow(r) : null;
+};
+export function nextInvoiceNumber(year: number): string {
+  const prefix = `INV-${year}-`;
+  const r = db.query("SELECT number FROM invoices WHERE number LIKE ? ORDER BY number DESC LIMIT 1").get(prefix + "%") as { number: string } | null;
+  const n = r ? parseInt(r.number.slice(prefix.length), 10) + 1 : 1;
+  return prefix + String(n).padStart(3, "0");
+}
+/**
+ * Draft an invoice for a pod over a date range. Hourly pods bill
+ * hours × each person's rate; retainer pods bill the flat retainer rate.
+ */
+export function generateInvoice(p: { pod_id: string; period_start: string; period_end: string }): Invoice {
+  const pod = getPod(p.pod_id);
+  if (!pod) throw Object.assign(new Error("pod not found"), { status: 404 });
+  if (!DAY_RE.test(p.period_start || "") || !DAY_RE.test(p.period_end || "") || p.period_start > p.period_end)
+    throw Object.assign(new Error("need a valid period_start <= period_end (YYYY-MM-DD)"), { status: 400 });
+  const entries = listEntries({ pod_id: p.pod_id, from: p.period_start, to: p.period_end }).filter((e) => e.billable);
+  const hours = Math.round(entries.reduce((a, e) => a + e.hours, 0) * 100) / 100;
+  let line_items: LineItem[]; let amount_cents: number;
+  if (pod.billing_type === "retainer") {
+    amount_cents = pod.retainer_rate_cents;
+    line_items = [{ description: `Monthly retainer — ${pod.name} (${p.period_start} → ${p.period_end})`, hours, amount_cents }];
+  } else {
+    const byPerson = new Map<string, { name: string; hours: number; rate: number }>();
+    for (const e of entries) {
+      const person = getPerson(e.person_id); if (!person) continue;
+      const g = byPerson.get(e.person_id) || { name: person.name, hours: 0, rate: person.hourly_rate_cents };
+      g.hours += e.hours; byPerson.set(e.person_id, g);
+    }
+    line_items = [...byPerson.entries()].map(([person_id, g]) => ({
+      person_id, person_name: g.name,
+      hours: Math.round(g.hours * 100) / 100, rate_cents: g.rate,
+      amount_cents: Math.round(g.hours * g.rate),
+    }));
+    amount_cents = line_items.reduce((a, l) => a + l.amount_cents, 0);
+  }
+  const year = Number(p.period_start.slice(0, 4));
+  const row = {
+    id: uid(), number: nextInvoiceNumber(year), pod_id: p.pod_id,
+    period_start: p.period_start, period_end: p.period_end,
+    line_items: JSON.stringify(line_items), hours, amount_cents,
+    status: "draft", stripe_invoice_id: null as string | null, qbo_id: null as string | null,
+    due_at: null as string | null, created_at: nowIso(),
+  };
+  db.query(`INSERT INTO invoices (id, number, pod_id, period_start, period_end, line_items, hours, amount_cents, status, stripe_invoice_id, qbo_id, due_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(row.id, row.number, row.pod_id, row.period_start, row.period_end, row.line_items, row.hours,
+      row.amount_cents, row.status, row.stripe_invoice_id, row.qbo_id, row.due_at, row.created_at);
+  return getInvoice(row.id)!;
+}
+export function sendInvoice(id: string, stripe?: { invoice_id: string }): Invoice {
+  const inv = getInvoice(id);
+  if (!inv) throw Object.assign(new Error("invoice not found"), { status: 404 });
+  if (inv.status !== "draft") throw Object.assign(new Error("only drafts can be sent"), { status: 409 });
+  const due = new Date(); due.setDate(due.getDate() + 14);
+  db.query("UPDATE invoices SET status = 'sent', due_at = ?, stripe_invoice_id = COALESCE(?, stripe_invoice_id) WHERE id = ?")
+    .run(localDay(due) , stripe?.invoice_id || null, id);
+  return getInvoice(id)!;
+}
+export function voidInvoice(id: string): Invoice {
+  const inv = getInvoice(id);
+  if (!inv) throw Object.assign(new Error("invoice not found"), { status: 404 });
+  if (inv.status === "paid") throw Object.assign(new Error("paid invoices cannot be voided"), { status: 409 });
+  db.query("UPDATE invoices SET status = 'void' WHERE id = ?").run(id);
+  return getInvoice(id)!;
+}
+export function markInvoicePaid(id: string): Invoice | null {
+  const inv = getInvoice(id); if (!inv) return null;
+  db.query("UPDATE invoices SET status = 'paid' WHERE id = ?").run(id);
+  return getInvoice(id);
+}
+export const getInvoiceByStripeId = (sid: string) => {
+  const r = db.query("SELECT * FROM invoices WHERE stripe_invoice_id = ?").get(sid) as any;
+  return r ? invoiceRow(r) : null;
+};
+/** QBO/Xero-shaped CSV fallback — the always-works bridge. */
+export function invoicesCsv(): string {
+  const esc = (v: string | number | null) => {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const head = "invoice_number,client,pod,period_start,period_end,issue_date,due_date,description,hours,amount,status";
+  const lines = listInvoices().flatMap((inv) =>
+    inv.line_items.map((l) => [
+      inv.number, inv.client_name || "", inv.pod_name || "", inv.period_start, inv.period_end,
+      inv.created_at.slice(0, 10), inv.due_at || "",
+      l.description || `${l.person_name || ""} — ${l.hours || 0}h @ ${l.rate_cents || 0}c`,
+      l.hours ?? inv.hours, (l.amount_cents / 100).toFixed(2), inv.status,
+    ].map(esc).join(","))
+  );
+  return head + "\n" + lines.join("\n") + "\n";
+}
+
 export { db };
+
+// ---------- integration bookkeeping (keeps raw SQL out of server.ts) ----------
+export function setPodStripeIds(podId: string, customerId: string, subscriptionId: string): void {
+  db.query("UPDATE pods SET stripe_customer_id = ?, stripe_subscription_id = ? WHERE id = ?")
+    .run(customerId, subscriptionId, podId);
+}
+export function setPodStripeCustomer(podId: string, customerId: string): void {
+  db.query("UPDATE pods SET stripe_customer_id = ? WHERE id = ?").run(customerId, podId);
+}
+export function setPodSlackChannel(podId: string, channelId: string): void {
+  db.query("UPDATE pods SET slack_channel_id = ? WHERE id = ?").run(channelId, podId);
+}
+export function setInvoiceQboId(id: string, qboId: string): void {
+  db.query("UPDATE invoices SET qbo_id = ? WHERE id = ?").run(qboId, id);
+}
