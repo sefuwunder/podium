@@ -23,7 +23,7 @@ import {
   listAvailability, setAvailability, deleteAvailability, enableBookingSlug,
   listBookings, getBooking, createBooking, publicBook, cancelBooking, linkBookingLead, freeSlots,
   listInvoices, getInvoice, generateInvoice, sendInvoice, voidInvoice, markInvoicePaid, getInvoiceByStripeId, invoicesCsv,
-  setPodStripeIds, setPodStripeCustomer, setPodSlackChannel, setInvoiceQboId,
+  setPodStripeIds, setPodStripeCustomer, setPodSlackChannel, setPodClickupList, setInvoiceQboId,
 } from "./db.ts";
 import {
   stripeCreateCustomer, stripeCreatePrice, stripeCreateSubscription,
@@ -32,6 +32,12 @@ import {
   slackCreateChannel, slackListChannels, slackLookupUser, slackInvite, slackPost,
   qboAuthUrl, qboExchangeCode, qboRefresh, qboBaseUrl, qboReq, buildQboInvoice,
 } from "./integrations.ts";
+import {
+  clickupVerify, listTasks, createTask, closeTask,
+} from "./clickup.ts";
+import {
+  getPodInbox, getInboxBody, testImap, clearInboxCache, imapConfigured, mockEmailDeps,
+} from "./email.ts";
 
 const PORT = Number(process.env.PORT || 3025);
 
@@ -85,6 +91,32 @@ if (MOCK) {
       if (url.includes("/query")) return ok({ QueryResponse: {} });
       if (url.includes("/customer")) return ok({ Customer: { Id: "9001" } });
       if (url.includes("/invoice")) return ok({ Invoice: { Id: "7001", DocNumber: "7001" } });
+      return ok({});
+    }
+    if (url.includes("api.clickup.com/api/v2")) {
+      const p = url.split("api.clickup.com/api/v2")[1] || "";
+      if (p === "/user" && method === "GET")
+        return ok({ user: { id: "cu1", username: "tester", email: "tester@example.com" } });
+      const mListTasks = p.match(/^\/list\/([^/]+)\/task$/);
+      if (mListTasks && method === "GET")
+        return ok({ tasks: [
+          { id: "t1", name: "Kickoff deck", status: { status: "to do", type: "open", color: "#d9d9d9" }, due_date: "1760000000000", assignees: [{ id: "cu1", username: "tester", email: "tester@example.com" }], url: "https://app.clickup.com/t/t1" },
+          { id: "t2", name: "Signed SOW", status: { status: "complete", type: "done", color: "#6bc950" }, due_date: null, assignees: [], url: "https://app.clickup.com/t/t2" },
+        ] });
+      if (mListTasks && method === "POST")
+        return ok({ id: "t3", name: params?.name || "task", status: { status: "to do", type: "open", color: "#d9d9d9" }, due_date: params?.due_date ? String(params.due_date) : null, assignees: [], url: "https://app.clickup.com/t/t3" });
+      const mList = p.match(/^\/list\/([^/]+)$/);
+      if (mList && method === "GET") {
+        if (decodeURIComponent(mList[1]) === "list-nodone")
+          return ok({ id: "list-nodone", name: "No Done List", statuses: [{ status: "to do", type: "open", color: "#d9d9d9" }] });
+        return ok({ id: decodeURIComponent(mList[1]), name: "Pod Tasks", statuses: [
+          { status: "to do", type: "open", color: "#d9d9d9" },
+          { status: "complete", type: "done", color: "#6bc950" },
+        ] });
+      }
+      const mTask = p.match(/^\/task\/([^/]+)$/);
+      if (mTask && method === "PUT")
+        return ok({ id: decodeURIComponent(mTask[1]), name: "Kickoff deck", status: { status: params?.status || "complete", type: "done", color: "#6bc950" }, due_date: null, assignees: [], url: "https://app.clickup.com/t/x" });
       return ok({});
     }
     return ok({});
@@ -554,6 +586,77 @@ const server = Bun.serve({
         if (!channel) return json({ error: "no channel yet — provision a pod channel first, or pass channel" }, 400);
         const r = await slackPost(token, channel, "Hello from Podium — Slack is connected.");
         return json({ ok: true, ts: r.ts });
+      }
+
+      // ----- ClickUp -----
+      if (path === "/api/integrations/clickup/test" && method === "POST") {
+        const token = getSetting("clickup_token");
+        const u = await clickupVerify(token);
+        return json({ ok: true, user: u });
+      }
+      if (seg(1) === "api" && seg(2) === "pods" && seg(4) === "clickup-list" && seg(3)) {
+        const pod = getPod(seg(3));
+        if (!pod) return json({ error: "not found" }, 404);
+        if (method === "PUT") {
+          const b = await readBody(req);
+          setPodClickupList(pod.id, String(b.list_id || "").trim());
+          return json({ pod: getPod(pod.id) });
+        }
+      }
+      if (seg(1) === "api" && seg(2) === "pods" && seg(4) === "tasks" && seg(3)) {
+        const pod = getPod(seg(3));
+        if (!pod) return json({ error: "not found" }, 404);
+        const token = getSetting("clickup_token");
+        if (seg(5)) {
+          // POST /api/pods/:id/tasks/:taskId/close
+          if (seg(6) === "close" && method === "POST") {
+            const t = await closeTask(token, seg(5), pod.clickup_list_id);
+            return json({ task: t });
+          }
+          return json({ error: "not found" }, 404);
+        }
+        if (method === "GET") return json({ tasks: await listTasks(token, pod.clickup_list_id) });
+        if (method === "POST") {
+          const b = await readBody(req);
+          const t = await createTask(token, pod.clickup_list_id, {
+            name: b.name, description: b.description, due_date: b.due_date || null,
+          });
+          return json({ task: t }, 201);
+        }
+      }
+
+      // ----- IMAP (Relay's zero-dep client, src/imap.ts) -----
+      // Test seam: globalThis.__podiumEmailDeps overrides the IMAP layer;
+      // PODIUM_MOCK_EMAIL=1 installs deterministic canned stubs (no sockets).
+      const emailOpts = (extra: any = {}) => {
+        let deps = (globalThis as any).__podiumEmailDeps;
+        if (!deps && process.env.PODIUM_MOCK_EMAIL === "1") deps = mockEmailDeps();
+        return { ...extra, deps };
+      };
+      if (path === "/api/integrations/imap/test" && method === "POST") {
+        await testImap(getSetting, emailOpts());
+        return json({ ok: true });
+      }
+      if (seg(1) === "api" && seg(2) === "pods" && seg(4) === "inbox" && seg(3)) {
+        const pod = getPod(seg(3));
+        if (!pod) return json({ error: "not found" }, 404);
+        const members = listMembers(pod.id).map((m) => ({
+          person_id: m.person_id, person_name: m.person_name || "", person_email: m.person_email || "",
+        }));
+        if (seg(5) === "refresh" && method === "POST") {
+          clearInboxCache(pod.id);
+          const r = await getPodInbox(pod.id, members, getSetting, emailOpts({ force: true }));
+          return json({ items: r.items, cached: r.cached });
+        }
+        if (seg(5) && seg(6) === "body" && method === "GET") {
+          const r = await getInboxBody(pod.id, seg(5), getSetting, emailOpts());
+          return json(r);
+        }
+        if (!seg(5) && method === "GET") {
+          const r = await getPodInbox(pod.id, members, getSetting, emailOpts());
+          return json({ items: r.items, cached: r.cached, cachedAt: r.cachedAt, configured: imapConfigured(getSetting) });
+        }
+        return json({ error: "not found" }, 404);
       }
       if (path === "/api/integrations/slack/provision-channel" && method === "POST") {
         const b = await readBody(req);

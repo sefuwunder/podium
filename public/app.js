@@ -94,6 +94,7 @@ var state = {
   replyTo: null, editingPage: false,
   timePerson: null, timeWeek: mondayOf(), entries: [],
   periods: [], period: null,
+  tasks: [], tasksErr: "", inbox: null, inboxLoading: false,
   err: "", okMsg: "",
 };
 function setErr(m) { state.err = m; state.okMsg = ""; render(); if (!reducedMotion && typeof document !== "undefined") window.scrollTo(0, 0); }
@@ -147,6 +148,15 @@ function loadPod(id, tab) {
     } else if (tab === "time") {
       loadTimeTab();
       return;
+    } else if (tab === "tasks") {
+      api("GET", "/api/pods/" + id + "/tasks").then(function (r) {
+        state.tasks = r.tasks; state.tasksErr = ""; render();
+      }).catch(function (e) { state.tasks = []; state.tasksErr = e.message; render(); });
+    } else if (tab === "inbox") {
+      state.inboxLoading = true; render();
+      api("GET", "/api/pods/" + id + "/inbox").then(function (r) {
+        state.inbox = r; state.inboxLoading = false; render();
+      }).catch(function (e) { state.inbox = { items: [], error: e.message }; state.inboxLoading = false; render(); });
     }
     render();
   }).catch(function (e) { setErr(e.message); });
@@ -317,7 +327,7 @@ function viewPods(pods) {
 }
 
 function viewPodHead(pod, tab, members, retainer, timers) {
-  var tabs = [["channels", "Channels"], ["pages", "Pages"], ["time", "Time"]].map(function (t) {
+  var tabs = [["channels", "Channels"], ["pages", "Pages"], ["time", "Time"], ["tasks", "Tasks"], ["inbox", "Inbox"]].map(function (t) {
     return '<div class="tab' + (tab === t[0] ? " active" : "") + '" onclick="location.hash=\'#/pod/' + pod.id + '/' + t[0] + '\'">' + t[1] + "</div>";
   }).join("");
   var mem = members.map(function (m) {
@@ -757,6 +767,17 @@ function viewSettings(s, templates) {
     '<div style="margin-top:10px"><label>Provision a private channel for a pod</label><div class="form-row"><div><select id="slack-pod">' +
     (s.pods || []).map(function (p) { return '<option value="' + p.id + '">' + esc(p.name) + (p.slack_channel_id ? " ✓" : "") + '</option>'; }).join("") +
     '</select></div><div><button class="btn small" type="button" onclick="Podium.provisionSlack()">Provision channel</button></div></div></div></div>' +
+    '<div class="card"><h3>ClickUp</h3><form onsubmit="return Podium.saveSettings(event,\'clickup\')">' +
+    '<div class="form-row">' + secretRow("clickup_token", "Personal token") + '</div>' +
+    '<div style="margin-top:10px;display:flex;gap:8px"><button class="btn small" type="submit">Save</button>' +
+    '<button class="btn small ghost" type="button" onclick="Podium.testClickup()">Verify token</button></div>' +
+    '<p class="muted">Link a ClickUp list per pod under its Tasks tab. Create a personal token in ClickUp under Settings → Apps.</p></form></div>' +
+    '<div class="card"><h3>Mailbox (IMAP)</h3><form onsubmit="return Podium.saveSettings(event,\'imap\')">' +
+    '<div class="form-row">' + textRow("imap_host", "IMAP host", "mail.example.com") + textRow("imap_port", "Port", "993") + '</div>' +
+    '<div class="form-row">' + textRow("imap_user", "Username") + secretRow("imap_pass", "Password") + '</div>' +
+    '<div style="margin-top:10px;display:flex;gap:8px"><button class="btn small" type="submit">Save</button>' +
+    '<button class="btn small ghost" type="button" onclick="Podium.testImap()">Test connection</button></div>' +
+    '<p class="muted">Powers each pod\'s Inbox tab — the latest thread with every member. Read-only: never marks mail seen. Uses the same zero-dep IMAP client as Relay.</p></form></div>' +
     '<div class="card"><h3>QuickBooks Online</h3><form onsubmit="return Podium.saveSettings(event,\'qbo\')">' +
     '<div class="form-row">' + textRow("qbo_client_id", "Client ID") + secretRow("qbo_client_secret", "Client secret") + '</div>' +
     '<div class="form-row">' + textRow("qbo_redirect_uri", "Redirect URI", "http://127.0.0.1:3025/api/integrations/qbo/callback") +
@@ -807,6 +828,69 @@ function viewTimerWidget(pod, members, timers) {
   return '<div class="timer-widget">' + inner + '</div>';
 }
 
+/* ---------- pod tasks (ClickUp) ---------- */
+function viewTasks(pod, tasks, err) {
+  var listId = pod.clickup_list_id || "";
+  var head = '<div class="card"><h3>ClickUp list</h3>' +
+    '<form onsubmit="return Podium.setClickupList(event,\'' + pod.id + '\')"><div class="form-row">' +
+    '<input name="list_id" placeholder="ClickUp list ID" value="' + esc(listId) + '" maxlength="60">' +
+    '</div><div style="margin-top:10px"><button class="btn small" type="submit">Link list</button> ' +
+    '<span class="muted">Find it in the ClickUp URL when a list is open.</span></div></form></div>';
+  if (err) {
+    var hint = /not connected/i.test(err)
+      ? ' <a href="#/settings">Add your ClickUp token in Settings</a>.'
+      : /no clickup list/i.test(err) ? ' Link a list above.' : '';
+    return head + '<div class="card"><div class="empty">' + esc(err) + '.' + hint + '</div></div>';
+  }
+  var rows = (tasks || []).map(function (t) {
+    var done = t.status_type === "done" || t.status_type === "closed";
+    var due = t.due_date ? new Date(t.due_date).toLocaleDateString() : "—";
+    var who = (t.assignees || []).map(function (a) { return esc(a.username || a.email); }).join(", ");
+    return '<div class="task-row' + (done ? " is-done" : "") + '">' +
+      '<button class="task-check' + (done ? " on" : "") + '" onclick="Podium.toggleTask(\'' + pod.id + "','" + t.id + '\',' + (!done) + ')" title="' + (done ? "done" : "mark done") + '"></button>' +
+      '<div class="task-main"><div class="task-name">' + esc(t.name) + '</div>' +
+      '<div class="task-meta"><span class="pill" style="background:' + esc(t.status_color || "var(--sand)") + '22;color:var(--ink)">' + esc(t.status) + '</span>' +
+      ' <span class="muted">due ' + esc(due) + (who ? ' · ' + who : '') + '</span>' +
+      (t.url ? ' <a href="' + esc(t.url) + '" target="_blank" rel="noopener" class="link-btn">Open in ClickUp</a>' : '') + '</div></div></div>';
+  }).join("");
+  return head +
+    '<div class="card"><div class="row between"><h3>Tasks</h3><span class="muted">' + (tasks || []).length + ' in list</span></div>' +
+    (rows || '<div class="empty">No tasks yet — add the first one below.</div>') + '</div>' +
+    '<div class="card"><h3>New task</h3>' +
+    '<form onsubmit="return Podium.createTask(event,\'' + pod.id + '\')">' +
+    '<label>Title</label><input name="name" required maxlength="120" placeholder="What needs doing?">' +
+    '<div class="form-row"><div><label>Due date</label><input name="due_date" type="date"></div>' +
+    '<div><label>Description</label><input name="description" maxlength="500" placeholder="Optional"></div></div>' +
+    '<div style="margin-top:10px"><button class="btn" type="submit">Add task</button></div></form></div>';
+}
+
+/* ---------- pod inbox (IMAP) ---------- */
+function viewInbox(pod, inbox, loading) {
+  var head = '<div class="row between" style="margin-bottom:14px"><div><h3 style="margin:0">Recent email with members</h3>' +
+    '<div class="muted">Latest thread with each pod member, via IMAP.</div></div>' +
+    '<button class="btn small ghost" onclick="Podium.refreshInbox(\'' + pod.id + '\')">Refresh</button></div>';
+  if (loading) return head + '<div class="card"><div class="empty">Checking the mailbox…</div></div>';
+  inbox = inbox || { items: [] };
+  if (inbox.error) {
+    var isCfg = /not configured/i.test(inbox.error);
+    return head + '<div class="card"><div class="empty">' + esc(inbox.error) + '.' +
+      (isCfg ? ' <a href="#/settings">Add your mailbox in Settings</a>.' : '') + '</div></div>';
+  }
+  var items = inbox.items || [];
+  var stamp = inbox.cached && inbox.cachedAt ? '<div class="muted" style="margin-bottom:10px">Cached ' + esc(timeAgo(inbox.cachedAt)) + ' — refresh for the latest.</div>' : '';
+  var rows = items.map(function (m) {
+    var dir = m.direction === "out" ? "you → " : "";
+    return '<div class="card inbox-item" id="inbox-' + esc(m.uid) + '">' +
+      '<div class="inbox-top"><b>' + esc(m.person_name) + '</b> <span class="muted">' + esc(m.email) + '</span></div>' +
+      '<div class="inbox-subj">' + esc(dir) + esc(m.subject || "(no subject)") + '</div>' +
+      '<div class="muted">' + esc(m.from) + ' · ' + esc(timeAgo(m.date)) + '</div>' +
+      '<div class="inbox-snip">' + esc(m.snippet) + '</div>' +
+      '<div class="inbox-body" style="display:none"></div>' +
+      '<button class="link-btn" onclick="Podium.toggleInboxBody(\'' + pod.id + "','" + esc(m.uid) + '\')">Read full email</button></div>';
+  }).join("");
+  return head + stamp + (rows || '<div class="card"><div class="empty">No recent email with pod members.</div></div>');
+}
+
 /* ---------- render orchestration ---------- */
 function currentView() {  var h = (location.hash || "#/home").replace(/^#/, "");
   return (h.split("/").filter(Boolean)[0] || "home");
@@ -827,6 +911,8 @@ function render() {
     if (tab === "channels") el.innerHTML = head + viewChannels(state.channels, state.channel && state.channel.id, state.messages, state.replyTo, state.members, state.pod.id);
     else if (tab === "pages") el.innerHTML = head + viewPages(state.pages, state.editingPage, state.page, state.templates, state.showTemplateForm);
     else if (tab === "time") el.innerHTML = head + viewTimeTab(state.pod, state.members, state.people, state.timePerson, state.timeWeek, state.entries);
+    else if (tab === "tasks") el.innerHTML = head + viewTasks(state.pod, state.tasks, state.tasksErr);
+    else if (tab === "inbox") el.innerHTML = head + viewInbox(state.pod, state.inbox, state.inboxLoading);
     fillMemberPicker();
   }
   else if (v === "people") el.innerHTML = viewPeople(state.people, state.weekHours || {});
@@ -838,11 +924,30 @@ function render() {
   else if (v === "settings") el.innerHTML = viewSettings(state.settings, state.templates);
   else el.innerHTML = viewHome(state.dash);
   if (state.editingPage) Podium.previewPage();
+  labelTables(document.getElementById("view"));
   updateTimerPill();
 }
 
 function currentViewParts() {
   return ((location.hash || "#/home").replace(/^#/, "").split("/").filter(Boolean));
+}
+/* Copy each table's header text into its cells' data-label, so the
+   mobile-first stylesheet can restack tables as labeled cards. */
+function labelTables(root) {
+  if (!root || !root.querySelectorAll) return;
+  root.querySelectorAll("table").forEach(function (t) {
+    var heads = [];
+    t.querySelectorAll("tr").forEach(function (tr) {
+      var ths = tr.querySelectorAll("th");
+      if (ths.length && !heads.length) {
+        heads = Array.prototype.map.call(ths, function (th) { return (th.textContent || "").trim(); });
+      } else {
+        Array.prototype.forEach.call(tr.querySelectorAll("td"), function (td, ci) {
+          if (heads[ci]) td.setAttribute("data-label", heads[ci]);
+        });
+      }
+    });
+  });
 }
 function fillMemberPicker() {
   var sel = document.getElementById("member-picker");
@@ -863,6 +968,7 @@ var Podium = {
   viewPipeline: viewPipeline, viewTop20: viewTop20, viewLead: viewLead, leadCard: leadCard,
   viewSchedule: viewSchedule, viewInvoices: viewInvoices, viewSettings: viewSettings,
   viewRetainerBar: viewRetainerBar, viewTimerWidget: viewTimerWidget, fmtMin: fmtMin, tempDot: tempDot,
+  viewTasks: viewTasks, viewInbox: viewInbox, labelTables: labelTables, timeAgo: timeAgo,
 
   createPod: function (e) {
     e.preventDefault();
@@ -1223,6 +1329,59 @@ var Podium = {
     api("GET", "/api/integrations/qbo/auth-url")
       .then(function (r) { window.open(r.url, "_blank"); })
       .catch(function (er) { setErr(er.message); });
+  },
+  testClickup: function () {
+    api("POST", "/api/integrations/clickup/test", {})
+      .then(function (r) { setOk("ClickUp connected — hello, " + r.user.username + "."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  testImap: function () {
+    api("POST", "/api/integrations/imap/test", {})
+      .then(function () { setOk("Mailbox connected — login succeeded."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  setClickupList: function (e, podId) {
+    e.preventDefault();
+    var v = e.target.list_id.value.trim();
+    api("PUT", "/api/pods/" + podId + "/clickup-list", { list_id: v })
+      .then(function () { loadPod(podId, "tasks"); setOk(v ? "ClickUp list linked." : "ClickUp list unlinked."); })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  createTask: function (e, podId) {
+    e.preventDefault();
+    var f = e.target;
+    api("POST", "/api/pods/" + podId + "/tasks", {
+      name: f.name.value, description: f.description.value, due_date: f.due_date.value || null,
+    }).then(function () { loadPod(podId, "tasks"); setOk("Task created in ClickUp."); })
+      .catch(function (er) { setErr(er.message); });
+    return false;
+  },
+  toggleTask: function (podId, taskId, close) {
+    if (!close) { setErr("Reopening a task must be done in ClickUp for now."); return; }
+    api("POST", "/api/pods/" + podId + "/tasks/" + taskId + "/close", {})
+      .then(function () { loadPod(podId, "tasks"); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  refreshInbox: function (podId) {
+    api("POST", "/api/pods/" + podId + "/inbox/refresh", {})
+      .then(function (r) { state.inbox = r; state.inboxLoading = false; render(); setOk("Inbox refreshed."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  toggleInboxBody: function (podId, uid) {
+    var card = document.getElementById("inbox-" + uid);
+    if (!card) return;
+    var body = card.querySelector(".inbox-body");
+    var btn = card.querySelector(".link-btn");
+    if (body.style.display !== "none") { body.style.display = "none"; body.innerHTML = ""; if (btn) btn.textContent = "Read full email"; return; }
+    body.innerHTML = '<div class="muted">Loading…</div>';
+    api("GET", "/api/pods/" + podId + "/inbox/" + encodeURIComponent(uid) + "/body")
+      .then(function (r) {
+        body.innerHTML = '<div class="msg-body">' + Podium.md(r.body || "(no text body)") + '</div>';
+        body.style.display = "block";
+        if (btn) btn.textContent = "Hide email";
+      })
+      .catch(function (er) { body.innerHTML = '<div class="err">' + er.message + '</div>'; body.style.display = "block"; });
   },
 };
 

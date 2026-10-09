@@ -28,6 +28,8 @@ bun src/server.ts
 - **Stripe** — test mode by default; sync monthly retainer subscriptions; send invoices through Stripe with hosted payment pages; `invoice.paid` webhook marks ours paid (signature-verified).
 - **Slack** — provision a private `pod-<slug>` channel per pod, invite members by email, plus calm notifications (timer start/stop, invoice sent/paid, deal won).
 - **QuickBooks Online** — OAuth connect, push invoices (customer find-or-create). Until connected, the CSV export is the bridge.
+- **ClickUp** — link a ClickUp list per pod; the pod's Tasks tab lists tasks (status, due, assignees, deep link), creates tasks, and closes them (resolves the list's done/closed status first). Token verified in Settings.
+- **Mailbox (IMAP)** — each pod's Inbox tab shows the latest email thread with every member, read-only (never marks mail seen), cached 5 minutes with manual refresh. Uses the same zero-dep IMAP client as Relay (`src/imap.ts`, copied verbatim).
 
 ### Payroll scope — a judgment call
 
@@ -39,9 +41,11 @@ Podium does **calculation + statements + CSV export**. No money moves through Po
 - **Stripe defaults to test mode.** Real money moves only with a live secret key and the mode flipped to Live.
 - **QBO OAuth is fully coded** but requires creating an Intuit app and connecting in Settings — until then, CSV export is the bridge.
 - **Stage machine**: deals move forward exactly one step; `lost` is reachable from anywhere; `won` and `lost` are terminal.
-- **Secrets** (Stripe keys, Slack token, QBO secrets) live in the server-side `settings` table only. `GET /api/settings` masks them; they never appear in client JS, logs, or the repo.
+- **Secrets** (Stripe keys, Slack token, QBO secrets, ClickUp token, IMAP password) live in the server-side `settings` table only. `GET /api/settings` masks them; they never appear in client JS, logs, or the repo.
 - **No external calendar sync** (Google/Outlook) in v1 — noted as future work.
 - **No inbound Slack mirroring** in v1 — outbound notifications + channel provisioning only.
+- **No background IMAP polling** in v1 — the Inbox tab fetches on open + manual refresh; the 5-minute cache keeps it from hammering the mail server.
+- **No ClickUp webhooks** in v1 — tasks refresh on tab open.
 
 ## API
 
@@ -82,6 +86,14 @@ REST JSON under `/api/*`:
 | `POST /api/integrations/slack/test` | hello-world to verify the token |
 | `GET /api/integrations/qbo/auth-url`, `GET /api/integrations/qbo/callback` | Intuit OAuth |
 | `POST /api/integrations/qbo/push-invoice/:id` | find-or-create customer, post invoice |
+| `POST /api/integrations/clickup/test` | verifies the personal token (`GET /user`) |
+| `PUT /api/pods/:id/clickup-list` | `{list_id}` — link a ClickUp list to the pod |
+| `GET/POST /api/pods/:id/tasks` | list / create tasks in the linked list |
+| `POST /api/pods/:id/tasks/:taskId/close` | resolves the list's done status, moves the task |
+| `POST /api/integrations/imap/test` | `validateImap` login check |
+| `GET /api/pods/:id/inbox` | latest thread per member (5-min cache) |
+| `POST /api/pods/:id/inbox/refresh` | clear cache + re-fetch |
+| `GET /api/pods/:id/inbox/:uid/body` | full body for one message |
 
 ## Tests
 

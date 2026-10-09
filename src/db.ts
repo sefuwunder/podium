@@ -123,6 +123,7 @@ export function initDb() {
   ensureColumn("pods", "slack_channel_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("pods", "stripe_customer_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("pods", "stripe_subscription_id", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("pods", "clickup_list_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("people", "booking_slug", "TEXT");
   seedTemplates();
 }
@@ -161,6 +162,7 @@ export interface Pod {
   id: string; name: string; client_name: string; color: string; created_at: string;
   billing_type: string; retainer_hours: number | null; retainer_rate_cents: number;
   slack_channel_id: string; stripe_customer_id: string; stripe_subscription_id: string;
+  clickup_list_id: string;
 }
 export const listPods = () => db.query("SELECT * FROM pods ORDER BY name COLLATE NOCASE").all() as Pod[];
 export const getPod = (id: string) => (db.query("SELECT * FROM pods WHERE id = ?").get(id) as Pod) || null;
@@ -170,6 +172,7 @@ export function createPod(p: { name: string; client_name?: string; color?: strin
     id: uid(), name: p.name.trim(), client_name: (p.client_name || "").trim(), color: p.color || "#c96f4a",
     created_at: nowIso(), billing_type: "hourly", retainer_hours: null, retainer_rate_cents: 0,
     slack_channel_id: "", stripe_customer_id: "", stripe_subscription_id: "",
+    clickup_list_id: "",
   };
   db.query("INSERT INTO pods (id, name, client_name, color, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(row.id, row.name, row.client_name, row.color, row.created_at);
@@ -196,10 +199,10 @@ export function deletePod(id: string): boolean {
 }
 
 // ---------- members ----------
-export interface PodMember { pod_id: string; person_id: string; role: string; joined_at: string; person_name?: string; }
+export interface PodMember { pod_id: string; person_id: string; role: string; joined_at: string; person_name?: string; person_email?: string; }
 export function listMembers(podId: string): PodMember[] {
   return db.query(
-    `SELECT m.*, p.name AS person_name FROM pod_members m JOIN people p ON p.id = m.person_id
+    `SELECT m.*, p.name AS person_name, p.email AS person_email FROM pod_members m JOIN people p ON p.id = m.person_id
      WHERE m.pod_id = ? ORDER BY p.name COLLATE NOCASE`
   ).all(podId) as PodMember[];
 }
@@ -535,6 +538,7 @@ export function seed() {
 const SECRET_KEYS = new Set([
   "stripe_test_secret", "stripe_live_secret", "stripe_webhook_secret",
   "slack_bot_token", "qbo_client_secret", "qbo_refresh_token",
+  "clickup_token", "imap_pass",
 ]);
 export const KNOWN_SETTINGS = [
   "stripe_mode", "stripe_test_publishable", "stripe_test_secret",
@@ -542,6 +546,8 @@ export const KNOWN_SETTINGS = [
   "slack_bot_token",
   "qbo_client_id", "qbo_client_secret", "qbo_redirect_uri", "qbo_sandbox",
   "qbo_realm_id", "qbo_refresh_token",
+  "clickup_token",
+  "imap_host", "imap_port", "imap_user", "imap_pass",
 ];
 export function getSetting(key: string): string {
   const r = db.query("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | null;
@@ -1189,6 +1195,9 @@ export function setPodStripeCustomer(podId: string, customerId: string): void {
 }
 export function setPodSlackChannel(podId: string, channelId: string): void {
   db.query("UPDATE pods SET slack_channel_id = ? WHERE id = ?").run(channelId, podId);
+}
+export function setPodClickupList(podId: string, listId: string): void {
+  db.query("UPDATE pods SET clickup_list_id = ? WHERE id = ?").run(listId, podId);
 }
 export function setInvoiceQboId(id: string, qboId: string): void {
   db.query("UPDATE invoices SET qbo_id = ? WHERE id = ?").run(qboId, id);
