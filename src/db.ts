@@ -111,6 +111,22 @@ export function initDb() {
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
     );
+    -- Phase 3: billing clearinghouse & automated distribution
+    CREATE TABLE IF NOT EXISTS billing_runs (
+      id TEXT PRIMARY KEY, run_month TEXT NOT NULL UNIQUE, ran_at TEXT NOT NULL,
+      invoice_ids TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS payouts (
+      id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL, person_id TEXT NOT NULL,
+      gross_cents INTEGER NOT NULL, spread_cents INTEGER NOT NULL, net_cents INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', stripe_transfer_id TEXT,
+      failure TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+      UNIQUE(invoice_id, person_id)
+    );
+    CREATE TABLE IF NOT EXISTS distributions (
+      id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL UNIQUE, ran_at TEXT NOT NULL,
+      mode TEXT NOT NULL, spread_pct REAL NOT NULL, created_at TEXT NOT NULL
+    );
     -- Phase 1: talent & pod allocation engine
     CREATE TABLE IF NOT EXISTS conflicts (
       id TEXT PRIMARY KEY, person_id TEXT NOT NULL, company TEXT NOT NULL DEFAULT '',
@@ -162,6 +178,7 @@ export function initDb() {
   ensureColumn("people", "skills", "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn("people", "rate_tier", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("people", "bio", "TEXT NOT NULL DEFAULT ''");
+  ensureColumn("people", "stripe_connect_id", "TEXT NOT NULL DEFAULT ''");
   ensureColumn("pod_members", "allocated_hours", "REAL");
   ensureColumn("pods", "match_slug", "TEXT");
   ensureColumn("pods", "match_visible", "INTEGER NOT NULL DEFAULT 0");
@@ -180,6 +197,7 @@ export interface Person {
   id: string; name: string; email: string; title: string; hourly_rate_cents: number;
   booking_slug: string | null; created_at: string;
   max_weekly_hours: number | null; skills: string[]; rate_tier: string; bio: string;
+  stripe_connect_id: string;
 }
 export const RATE_TIERS = ["", "I", "II", "III", "$", "$$", "$$$"];
 /** Normalize a skills input (array or comma-separated string) → deduped trimmed list. */
@@ -228,6 +246,7 @@ export const getPerson = (id: string) => {
 export function createPerson(p: {
   name: string; email?: string; title?: string; hourly_rate_cents?: number;
   max_weekly_hours?: number | null; skills?: string[] | string; rate_tier?: string; bio?: string;
+  stripe_connect_id?: string;
 }): Person {
   if (!p.name?.trim()) throw Object.assign(new Error("name is required"), { status: 400 });
   const rate = Math.round(Number(p.hourly_rate_cents) || 0);
@@ -239,10 +258,11 @@ export function createPerson(p: {
     skills: JSON.stringify(normalizeSkills(p.skills)),
     rate_tier: validRateTier(p.rate_tier),
     bio: String(p.bio || "").trim().slice(0, 600),
+    stripe_connect_id: String(p.stripe_connect_id || "").trim().slice(0, 60),
   };
-  db.query("INSERT INTO people (id, name, email, title, hourly_rate_cents, booking_slug, created_at, max_weekly_hours, skills, rate_tier, bio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+  db.query("INSERT INTO people (id, name, email, title, hourly_rate_cents, booking_slug, created_at, max_weekly_hours, skills, rate_tier, bio, stripe_connect_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
     .run(row.id, row.name, row.email, row.title, row.hourly_rate_cents, row.booking_slug, row.created_at,
-      row.max_weekly_hours, row.skills, row.rate_tier, row.bio);
+      row.max_weekly_hours, row.skills, row.rate_tier, row.bio, row.stripe_connect_id);
   return getPerson(row.id)!;
 }
 export function updatePerson(id: string, p: Partial<Person> & { skills?: string[] | string }): Person | null {
@@ -256,9 +276,10 @@ export function updatePerson(id: string, p: Partial<Person> & { skills?: string[
     skills: JSON.stringify(p.skills === undefined ? cur.skills : normalizeSkills(p.skills)),
     rate_tier: p.rate_tier === undefined ? cur.rate_tier : validRateTier(p.rate_tier),
     bio: String(p.bio ?? cur.bio).trim().slice(0, 600),
+    stripe_connect_id: String(p.stripe_connect_id ?? cur.stripe_connect_id).trim().slice(0, 60),
   };
-  db.query("UPDATE people SET name = ?, email = ?, title = ?, hourly_rate_cents = ?, max_weekly_hours = ?, skills = ?, rate_tier = ?, bio = ? WHERE id = ?")
-    .run(row.name, row.email, row.title, row.hourly_rate_cents, row.max_weekly_hours, row.skills, row.rate_tier, row.bio, id);
+  db.query("UPDATE people SET name = ?, email = ?, title = ?, hourly_rate_cents = ?, max_weekly_hours = ?, skills = ?, rate_tier = ?, bio = ?, stripe_connect_id = ? WHERE id = ?")
+    .run(row.name, row.email, row.title, row.hourly_rate_cents, row.max_weekly_hours, row.skills, row.rate_tier, row.bio, row.stripe_connect_id, id);
   return getPerson(id);
 }
 export function deletePerson(id: string): boolean {
@@ -890,6 +911,7 @@ export const KNOWN_SETTINGS = [
   "qbo_realm_id", "qbo_refresh_token",
   "clickup_token",
   "imap_host", "imap_port", "imap_user", "imap_pass",
+  "platform_spread_pct", "payouts_live",
 ];
 export function getSetting(key: string): string {
   const r = db.query("SELECT value FROM settings WHERE key = ?").get(key) as { value: string } | null;
@@ -1535,6 +1557,148 @@ export function invoicesCsv(): string {
     ].map(esc).join(","))
   );
   return head + "\n" + lines.join("\n") + "\n";
+}
+
+// ---------- Phase 3: billing clearinghouse & automated distribution ----------
+
+/** The agency cut, percent. Firm setting `platform_spread_pct`, default 20, clamped 0–90. */
+export function platformSpreadPct(): number {
+  const raw = getSetting("platform_spread_pct");
+  if (raw === "") return 20;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < 0 || v > 90) return 20;
+  return Math.round(v * 100) / 100;
+}
+
+/** Swappable "today" for tests: globalThis.__podiumToday or PODIUM_TODAY env. */
+export function billingToday(): Date {
+  const o = (globalThis as any).__podiumToday || process.env.PODIUM_TODAY;
+  return o ? new Date(o) : new Date();
+}
+export function monthKey(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+/** First/last calendar day of a YYYY-MM month. */
+export function monthBounds(month: string): { start: string; end: string } {
+  const m = /^(\d{4})-(\d{2})$/.exec(month || "");
+  if (!m || Number(m[2]) < 1 || Number(m[2]) > 12)
+    throw Object.assign(new Error("month must be YYYY-MM"), { status: 400 });
+  const last = new Date(Number(m[1]), Number(m[2]), 0).getDate();
+  return { start: `${m[1]}-${m[2]}-01`, end: `${m[1]}-${m[2]}-${String(last).padStart(2, "0")}` };
+}
+
+export interface SplitShare {
+  person_id: string; person_name: string; hours: number;
+  gross_cents: number; spread_cents: number; net_cents: number;
+}
+/**
+ * Revenue split for a paid invoice: each exec's share = their billable hours ÷
+ * total billable hours in the invoice period (even split among pod members when
+ * nobody logged time, e.g. flat retainer). Largest-remainder on gross so the
+ * shares sum to the invoice amount exactly; net = gross − spread per person so
+ * Σ(spread + net) = amount always holds.
+ */
+export function computeSplit(invoiceId: string, spreadPct?: number): SplitShare[] {
+  const inv = getInvoice(invoiceId);
+  if (!inv) throw Object.assign(new Error("invoice not found"), { status: 404 });
+  const pct = spreadPct ?? platformSpreadPct();
+  const members = listMembers(inv.pod_id);
+  if (!members.length) throw Object.assign(new Error("pod has no members to split between"), { status: 400 });
+  const hoursBy = new Map<string, number>();
+  for (const e of listEntries({ pod_id: inv.pod_id, from: inv.period_start, to: inv.period_end })) {
+    if (!e.billable) continue;
+    hoursBy.set(e.person_id, (hoursBy.get(e.person_id) || 0) + e.hours);
+  }
+  const total = [...hoursBy.values()].reduce((a, b) => a + b, 0);
+  const weighted = members.map((m) => {
+    const h = hoursBy.get(m.person_id) || 0;
+    return { person_id: m.person_id, person_name: m.person_name || "", hours: h, w: total > 0 ? h / total : 1 / members.length };
+  });
+  const floored = weighted.map((x) => ({ ...x, floor: Math.floor(x.w * inv.amount_cents), frac: (x.w * inv.amount_cents) % 1 }));
+  let remainder = inv.amount_cents - floored.reduce((a, f) => a + f.floor, 0);
+  const extra = new Set<string>();
+  for (const f of [...floored].sort((a, b) => b.frac - a.frac)) {
+    if (remainder <= 0) break;
+    extra.add(f.person_id); remainder--;
+  }
+  return floored.map((f) => {
+    const gross = f.floor + (extra.has(f.person_id) ? 1 : 0);
+    const spread = Math.round((gross * pct) / 100);
+    return {
+      person_id: f.person_id, person_name: f.person_name,
+      hours: Math.round(f.hours * 100) / 100,
+      gross_cents: gross, spread_cents: spread, net_cents: gross - spread,
+    };
+  });
+}
+
+export interface PayoutRow {
+  id: string; invoice_id: string; person_id: string; person_name?: string;
+  gross_cents: number; spread_cents: number; net_cents: number;
+  status: string; stripe_transfer_id: string | null; failure: string; created_at: string;
+}
+/** Write the distribution ledger for an invoice. Idempotent — 409 if one exists. */
+export function recordDistribution(invoiceId: string, mode: "dry_run" | "live", shares: SplitShare[]): { distribution: any; payouts: PayoutRow[] } {
+  const inv = getInvoice(invoiceId);
+  if (!inv) throw Object.assign(new Error("invoice not found"), { status: 404 });
+  const existing = db.query("SELECT id FROM distributions WHERE invoice_id = ?").get(invoiceId);
+  if (existing) throw Object.assign(new Error("this invoice was already distributed"), { status: 409 });
+  const now = nowIso();
+  const did = uid();
+  const spreadPct = platformSpreadPct();
+  db.query("INSERT INTO distributions (id, invoice_id, ran_at, mode, spread_pct, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .run(did, invoiceId, now, mode, spreadPct, now);
+  for (const s of shares) {
+    db.query(`INSERT INTO payouts (id, invoice_id, person_id, gross_cents, spread_cents, net_cents, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`)
+      .run(uid(), invoiceId, s.person_id, s.gross_cents, s.spread_cents, s.net_cents, now);
+  }
+  return getDistribution(invoiceId)!;
+}
+export function getDistribution(invoiceId: string): { distribution: any; payouts: PayoutRow[] } | null {
+  const d = db.query("SELECT * FROM distributions WHERE invoice_id = ?").get(invoiceId) as any;
+  if (!d) return null;
+  const payouts = db.query(
+    `SELECT p.*, pe.name AS person_name FROM payouts p LEFT JOIN people pe ON pe.id = p.person_id
+     WHERE p.invoice_id = ? ORDER BY p.net_cents DESC`
+  ).all(invoiceId) as PayoutRow[];
+  return { distribution: d, payouts };
+}
+export function listPayouts(f: { person_id?: string; status?: string } = {}): PayoutRow[] {
+  let q = `SELECT p.*, pe.name AS person_name, i.number AS invoice_number FROM payouts p
+    LEFT JOIN people pe ON pe.id = p.person_id LEFT JOIN invoices i ON i.id = p.invoice_id WHERE 1=1`;
+  const args: any[] = [];
+  if (f.person_id) { q += " AND p.person_id = ?"; args.push(f.person_id); }
+  if (f.status) { q += " AND p.status = ?"; args.push(f.status); }
+  return db.query(q + " ORDER BY p.created_at DESC").all(...args) as PayoutRow[];
+}
+export function markPayoutPaid(payoutId: string, transferId: string | null): void {
+  db.query("UPDATE payouts SET status = 'paid', stripe_transfer_id = COALESCE(?, stripe_transfer_id), failure = '' WHERE id = ?")
+    .run(transferId, payoutId);
+}
+export function markPayoutFailed(payoutId: string, failure: string): void {
+  db.query("UPDATE payouts SET status = 'failed', failure = ? WHERE id = ?").run(String(failure).slice(0, 300), payoutId);
+}
+/** Live payouts are armed only when the firm flips the switch AND Stripe is connected. */
+export function payoutsLiveArmed(): boolean {
+  return getSetting("payouts_live") === "1" && !!activeStripeSecret();
+}
+
+// ---------- 1st-of-month billing runs ----------
+export function listBillingRuns(): any[] {
+  return (db.query("SELECT * FROM billing_runs ORDER BY run_month DESC").all() as any[]).map((r) => ({
+    ...r, items: JSON.parse(r.invoice_ids || "[]"),
+  }));
+}
+export function getBillingRun(month: string): any | null {
+  const r = db.query("SELECT * FROM billing_runs WHERE run_month = ?").get(month) as any;
+  return r ? { ...r, items: JSON.parse(r.invoice_ids || "[]") } : null;
+}
+export function recordBillingRun(month: string, items: any[]): any {
+  const now = nowIso();
+  db.query("INSERT INTO billing_runs (id, run_month, ran_at, invoice_ids, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_month) DO UPDATE SET ran_at = excluded.ran_at, invoice_ids = excluded.invoice_ids")
+    .run(uid(), month, now, JSON.stringify(items), now);
+  return getBillingRun(month);
 }
 
 export { db };

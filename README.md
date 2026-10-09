@@ -41,7 +41,15 @@ bun src/server.ts
 
 ### Payroll scope — a judgment call
 
-Podium does **calculation + statements + CSV export**. No money moves through Podium, and it never will from this codebase: self-hosted disbursement (ACH/wires/payouts) would be irresponsible to fake. Take the CSV to your payroll provider.
+Podium does **calculation + statements + CSV export** for payroll. Payroll itself never moves money through Podium — take the CSV to your payroll provider. Client revenue distribution (below) is the deliberate exception: it moves money, but only over Stripe Connect, only when explicitly armed.
+
+### Clearinghouse judgment calls (phase 3)
+
+- **Dry-run is the default, stated loudly.** The split engine computes everything and records it, but Stripe is only called when the firm flips **Live payouts** in Settings *and* Stripe is connected. Until then payouts sit at `pending` with a "DRY RUN — no money moved" badge. Real payouts move real money; the default must be the safe one.
+- **Stripe Connect is the only payout rail in v1.** Execs need a `stripe_connect_id` (e.g. `acct_123`) on their People record — it's an account id, not a secret, so it's displayed, never masked. No Gusto/Deel in v1 (noted as future).
+- **Split math is pro-rata by billable hours** in the invoice period; zero hours (e.g. flat retainer, no time logged) falls back to an even split among pod members. All integer cents with largest-remainder, so Σ nets + Σ spreads = invoice amount exactly. The platform spread defaults to 20% (firm setting, clamped 0–90).
+- **Distribution is idempotent**: one `distributions` row per invoice (409 on re-distribute); payouts are the ledger. A payout for an exec with no Connect id fails individually with a clear reason — the rest still go through.
+- **The 1st-of-month scheduler is in-process** (boot + hourly check, server-local day). The server must be running on the 1st for the automatic run — a missed month is backfilled with `POST /api/billing/run {month}` (refuses to re-run unless `force: true`). Subscription pods are logged as "subscription-billed" (Stripe auto-bills; no local invoice); the rest get generated + sent invoices.
 
 ### Integration judgment calls
 
@@ -103,6 +111,9 @@ REST JSON under `/api/*`:
 | `GET /book/:slug`, `GET /book/:slug/slots`, `POST /book/:slug` | public booking page (no auth) |
 | `POST /api/invoices/generate`, `GET /api/invoices`, `GET /api/invoices/:id` | draft invoices, `INV-YYYY-NNN` numbering |
 | `POST /api/invoices/:id/send`, `POST /api/invoices/:id/void` | send via Stripe if connected, else mark sent |
+| `POST /api/invoices/:id/distribute`, `GET /api/invoices/:id/distribution` | revenue split to execs (dry-run unless live payouts armed); 409 if unpaid/already distributed |
+| `GET /api/payouts?person_id&status` | firm-wide payout ledger |
+| `POST /api/billing/run`, `GET /api/billing/runs` | 1st-of-month retainer billing (`{month, force?}`); history |
 | `GET /api/invoices/export.csv` | QBO/Xero-shaped fallback |
 | `GET /api/settings`, `POST /api/settings` | secrets masked on read |
 | `POST /api/integrations/stripe/sync-retainers` | Stripe customers + monthly subscriptions for retainer pods |

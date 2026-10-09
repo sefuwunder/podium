@@ -34,10 +34,14 @@ import {
   listAlerts, unseenAlertCount, markAlertSeen, checkRetainerAlerts,
   getPageSigningForPage, getSigningByToken, createPageSigning, revokePageSigning, signPageSigning,
   createIntakeLead, BUDGET_BANDS,
+  // phase 3: billing clearinghouse & automated distribution
+  platformSpreadPct, billingToday, monthKey, monthBounds, computeSplit,
+  recordDistribution, getDistribution, listPayouts, markPayoutPaid, markPayoutFailed,
+  payoutsLiveArmed, listBillingRuns, getBillingRun, recordBillingRun,
 } from "./db.ts";
 import {
   stripeCreateCustomer, stripeCreatePrice, stripeCreateSubscription,
-  stripeCreateInvoiceItem, stripeCreateInvoice, stripeFinalizeInvoice,
+  stripeCreateInvoiceItem, stripeCreateInvoice, stripeFinalizeInvoice, stripeCreateTransfer,
   verifyStripeWebhook,
   slackCreateChannel, slackListChannels, slackLookupUser, slackInvite, slackPost,
   qboAuthUrl, qboExchangeCode, qboRefresh, qboBaseUrl, qboReq, buildQboInvoice,
@@ -79,6 +83,7 @@ if (MOCK) {
       if (url.endsWith("/invoiceitems")) return ok({ id: "ii_mock1" });
       if (/\/invoices\/[^/]+\/finalize/.test(url)) return ok({ id: "in_mock1", hosted_invoice_url: "https://pay.stripe.com/mock1" });
       if (url.endsWith("/invoices")) return ok({ id: "in_mock1" });
+      if (url.endsWith("/transfers")) return ok({ id: "tr_mock1" });
       return ok({});
     }
     if (url.includes("slack.com/api/")) {
@@ -153,6 +158,119 @@ async function notifySlack(podId: string | null, text: string): Promise<void> { 
   } catch { /* notifications are fire-and-forget */ }
 }
 const moneyStr = (cents: number) => "$" + (Number(cents) / 100).toFixed(2);
+
+/** Create + finalize the Stripe invoice for one of ours. Null when Stripe isn't connected. */
+async function stripeSendInvoice(inv: { id: string; number: string; pod_id: string; line_items: any[] }): Promise<{ invoice_id: string; hosted_url: string | null } | null> {
+  const secret = activeStripeSecret();
+  if (!secret) return null;
+  const pod = getPod(inv.pod_id);
+  if (!pod) throw Object.assign(new Error("pod not found"), { status: 404 });
+  let customerId = pod.stripe_customer_id;
+  if (!customerId) {
+    const c = await stripeCreateCustomer(secret, { name: pod.client_name || pod.name });
+    customerId = c.id;
+    setPodStripeCustomer(pod.id, customerId);
+  }
+  for (const l of inv.line_items) {
+    await stripeCreateInvoiceItem(secret, {
+      customer: customerId,
+      amount_cents: Math.round(l.amount_cents),
+      description: l.description || `${l.person_name || "Services"} — ${l.hours || 0}h`,
+    });
+  }
+  const si = await stripeCreateInvoice(secret, {
+    customer: customerId,
+    metadata: { podium_invoice_id: inv.id, podium_number: inv.number },
+  });
+  const fin = await stripeFinalizeInvoice(secret, si.id);
+  return { invoice_id: fin.id, hosted_url: fin.hosted_invoice_url || null };
+}
+
+/**
+ * Phase 3: distribute a paid invoice to the pod's execs.
+ * Dry-run by default — Stripe transfers only fire when `payouts_live=1` is set
+ * in Settings AND Stripe is connected. Idempotent: 409 on a second call.
+ */
+async function executeDistribution(invoiceId: string): Promise<{ distribution: any; payouts: any[]; mode: string }> {
+  const inv = getInvoice(invoiceId);
+  if (!inv) throw Object.assign(new Error("invoice not found"), { status: 404 });
+  if (inv.status !== "paid") throw Object.assign(new Error("only paid invoices can be distributed"), { status: 409 });
+  if (getDistribution(invoiceId)) throw Object.assign(new Error("this invoice was already distributed"), { status: 409 });
+  const live = payoutsLiveArmed();
+  const mode = live ? "live" : "dry_run";
+  const shares = computeSplit(invoiceId);
+  const { distribution, payouts } = recordDistribution(invoiceId, mode as "dry_run" | "live", shares);
+  if (live) {
+    const secret = activeStripeSecret();
+    for (const p of payouts) {
+      const person = getPerson(p.person_id);
+      if (!person?.stripe_connect_id) {
+        markPayoutFailed(p.id, "no Stripe Connect payout account on file for this exec");
+        continue;
+      }
+      try {
+        const tr = await stripeCreateTransfer(secret, {
+          amount_cents: p.net_cents,
+          destination: person.stripe_connect_id,
+          description: `Podium payout ${inv.number} — ${person.name}`,
+        });
+        markPayoutPaid(p.id, tr.id);
+      } catch (e: any) {
+        markPayoutFailed(p.id, e?.message || "transfer failed");
+      }
+    }
+  }
+  const done = getDistribution(invoiceId)!;
+  notifySlack(inv.pod_id,
+    `Revenue split for ${inv.number} (${moneyStr(inv.amount_cents)}): ` +
+    done.payouts.map((p: any) => `${p.person_name} ${moneyStr(p.net_cents)}`).join(", ") +
+    (mode === "dry_run" ? " — DRY RUN, no money moved." : " — transfers sent."));
+  return { distribution: done.distribution, payouts: done.payouts, mode };
+}
+
+/**
+ * Phase 3: 1st-of-month billing. For every retainer pod: subscription pods are
+ * auto-billed by Stripe (logged, no local invoice); the rest get a generated +
+ * sent invoice for the new month. Idempotent per month unless force=true.
+ */
+async function runBilling(month: string, opts: { force?: boolean } = {}): Promise<any[]> {
+  const bounds = monthBounds(month); // validates YYYY-MM
+  if (getBillingRun(month) && !opts.force)
+    throw Object.assign(new Error(`billing already ran for ${month} — pass force to re-run`), { status: 409 });
+  const items: any[] = [];
+  for (const pod of listPods()) {
+    if (pod.billing_type !== "retainer") continue;
+    if (pod.stripe_subscription_id) {
+      items.push({ pod_id: pod.id, pod_name: pod.name, via: "subscription", invoice_id: null, number: null });
+      continue;
+    }
+    try {
+      const inv = generateInvoice({ pod_id: pod.id, period_start: bounds.start, period_end: bounds.end });
+      const s = await stripeSendInvoice(inv);
+      const sent = sendInvoice(inv.id, s ? { invoice_id: s.invoice_id } : undefined);
+      items.push({ pod_id: pod.id, pod_name: pod.name, via: "invoice", invoice_id: sent.id, number: sent.number, hosted_url: s?.hosted_url || null });
+      notifySlack(pod.id, `Retainer invoice ${sent.number} (${moneyStr(sent.amount_cents)}) issued for ${month}.`);
+    } catch (e: any) {
+      items.push({ pod_id: pod.id, pod_name: pod.name, via: "error", invoice_id: null, number: null, error: e?.message || "failed" });
+    }
+  }
+  recordBillingRun(month, items);
+  return items;
+}
+
+/** Hourly in-process check: on the 1st (server local time), run billing once for the month. */
+async function billingCheck(): Promise<void> {
+  try {
+    const now = billingToday();
+    if (now.getDate() !== 1) return;
+    const month = monthKey(now);
+    if (getBillingRun(month)) return;
+    await runBilling(month);
+    console.log(`[billing] 1st-of-month run completed for ${month}`);
+  } catch (e: any) {
+    console.error("[billing] run failed:", e?.message || e);
+  }
+}
 
 function json(v: unknown, status = 200): Response {
   return new Response(JSON.stringify(v), { status, headers: { "Content-Type": "application/json" } });
@@ -626,36 +744,10 @@ const server = Bun.serve({
       if (seg(1) === "api" && seg(2) === "invoices" && seg(4) === "send" && seg(3) && method === "POST") {
         const inv = getInvoice(seg(3));
         if (!inv) return json({ error: "not found" }, 404);
-        const secret = activeStripeSecret();
-        let stripe: { invoice_id: string } | undefined;
-        let hosted_url: string | null = null;
-        if (secret) {
-          const pod = getPod(inv.pod_id);
-          if (!pod) return json({ error: "pod not found" }, 404);
-          let customerId = pod.stripe_customer_id;
-          if (!customerId) {
-            const c = await stripeCreateCustomer(secret, { name: pod.client_name || pod.name });
-            customerId = c.id;
-            setPodStripeCustomer(pod.id, customerId);
-          }
-          for (const l of inv.line_items) {
-            await stripeCreateInvoiceItem(secret, {
-              customer: customerId,
-              amount_cents: Math.round(l.amount_cents),
-              description: l.description || `${l.person_name || "Services"} — ${l.hours || 0}h`,
-            });
-          }
-          const si = await stripeCreateInvoice(secret, {
-            customer: customerId,
-            metadata: { podium_invoice_id: inv.id, podium_number: inv.number },
-          });
-          const fin = await stripeFinalizeInvoice(secret, si.id);
-          stripe = { invoice_id: fin.id };
-          hosted_url = fin.hosted_invoice_url || null;
-        }
-        const sent = sendInvoice(inv.id, stripe);
+        const s = await stripeSendInvoice(inv);
+        const sent = sendInvoice(inv.id, s ? { invoice_id: s.invoice_id } : undefined);
         notifySlack(inv.pod_id, `Invoice ${sent.number} (${moneyStr(sent.amount_cents)}) sent to ${sent.client_name || sent.pod_name}.`);
-        return json({ invoice: sent, hosted_url });
+        return json({ invoice: sent, hosted_url: s?.hosted_url || null });
       }
       if (seg(1) === "api" && seg(2) === "invoices" && seg(4) === "void" && seg(3) && method === "POST") {
         return json({ invoice: voidInvoice(seg(3)) });
@@ -664,6 +756,31 @@ const server = Bun.serve({
         const inv = getInvoice(seg(3));
         if (!inv) return json({ error: "not found" }, 404);
         return json({ invoice: inv });
+      }
+      // ----- phase 3: clearinghouse -----
+      if (seg(1) === "api" && seg(2) === "invoices" && seg(4) === "distribute" && seg(3) && method === "POST") {
+        const r = await executeDistribution(seg(3));
+        return json(r);
+      }
+      if (seg(1) === "api" && seg(2) === "invoices" && seg(4) === "distribution" && seg(3) && method === "GET") {
+        const d = getDistribution(seg(3));
+        if (!d) return json({ error: "not distributed yet" }, 404);
+        return json({ ...d, payouts_live_armed: payoutsLiveArmed(), spread_pct: platformSpreadPct() });
+      }
+      if (path === "/api/payouts" && method === "GET") {
+        return json({
+          payouts: listPayouts({ person_id: url.searchParams.get("person_id") || undefined, status: url.searchParams.get("status") || undefined }),
+          spread_pct: platformSpreadPct(),
+        });
+      }
+      if (path === "/api/billing/run" && method === "POST") {
+        const b = await readBody(req);
+        const month = String(b.month || monthKey(billingToday()));
+        const items = await runBilling(month, { force: !!b.force });
+        return json({ month, items });
+      }
+      if (path === "/api/billing/runs" && method === "GET") {
+        return json({ runs: listBillingRuns(), spread_pct: platformSpreadPct(), payouts_live_armed: payoutsLiveArmed() });
       }
 
       // ----- settings -----
@@ -706,11 +823,15 @@ const server = Bun.serve({
         try { event = JSON.parse(raw); } catch { return json({ error: "bad json" }, 400); }
         if (event.type === "invoice.paid") {
           const obj = event.data?.object || {};
-          const ours = (obj.id && getInvoiceByStripeId(obj.id))
-            || (obj.metadata?.podium_invoice_id && getInvoice(obj.metadata.podium_invoice_id));
+          // Prefer our own metadata id (unambiguous); fall back to the Stripe invoice id.
+          const ours = (obj.metadata?.podium_invoice_id && getInvoice(obj.metadata.podium_invoice_id))
+            || (obj.id && getInvoiceByStripeId(obj.id));
           if (ours && ours.status !== "paid") {
             markInvoicePaid(ours.id);
             notifySlack(ours.pod_id, `Invoice ${ours.number} (${moneyStr(ours.amount_cents)}) paid.`);
+            // Phase 3: auto-distribute on payment (dry-run unless live payouts are armed).
+            try { await executeDistribution(ours.id); }
+            catch (e: any) { console.error("[clearinghouse] auto-distribute failed:", e?.message || e); }
           }
         }
         return json({ received: true });
@@ -916,3 +1037,9 @@ const server = Bun.serve({
 });
 
 console.log(`podium on http://127.0.0.1:${PORT}`);
+
+// Phase 3: in-process 1st-of-month billing scheduler. Runs on boot and hourly
+// thereafter. The server must be running on the 1st for the automatic run —
+// a missed run can be backfilled with POST /api/billing/run {month}.
+billingCheck();
+setInterval(billingCheck, 3600_000);

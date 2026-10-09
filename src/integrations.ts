@@ -65,6 +65,13 @@ export const stripeCreateInvoice = (secret: string, p: { customer: string; metad
 export const stripeFinalizeInvoice = (secret: string, invoiceId: string) =>
   stripeReq(secret, "POST", `/invoices/${invoiceId}/finalize`, {});
 
+/** Stripe Connect transfer — the payout rail. Only called when live payouts are armed. */
+export const stripeCreateTransfer = (secret: string, p: { amount_cents: number; destination: string; description: string }) =>
+  stripeReq(secret, "POST", "/transfers", {
+    amount: p.amount_cents, currency: "usd",
+    destination: p.destination, description: p.description.slice(0, 500),
+  });
+
 /**
  * Verify a Stripe webhook signature. Stripe-Signature looks like
  * "t=1492774577,v1=5257a869...". Returns false on any mismatch.

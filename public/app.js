@@ -266,13 +266,14 @@ function loadSchedule() {
   }).catch(function (e) { setErr(e.message); });
 }
 function loadInvoices(invoiceId) {
-  Promise.all([api("GET", "/api/invoices"), api("GET", "/api/pods")]).then(function (r) {
-    state.invoices = r[0].invoices; state.pods = r[1].pods;
+  Promise.all([api("GET", "/api/invoices"), api("GET", "/api/pods"), api("GET", "/api/billing/runs"), api("GET", "/api/payouts")]).then(function (r) {
+    state.invoices = r[0].invoices; state.pods = r[1].pods; state.billingRuns = r[2].runs; state.payouts = r[3].payouts;
     if (invoiceId) {
       return Promise.all([
         api("GET", "/api/invoices/" + invoiceId),
         api("GET", "/api/integrations/qbo/status"),
-      ]).then(function (x) { state.invoice = { invoice: x[0].invoice, qboConnected: x[1].connected }; render(); });
+        api("GET", "/api/invoices/" + invoiceId + "/distribution").catch(function () { return null; }),
+      ]).then(function (x) { state.invoice = { invoice: x[0].invoice, qboConnected: x[1].connected, distribution: x[2] }; render(); });
     }
     state.invoice = null; render();
   }).catch(function (e) { setErr(e.message); });
@@ -362,6 +363,41 @@ function viewHome(d) {
     (d.openPeriod ? (per || '<div class="empty">No entries in this period yet.</div>') : '<div class="empty">No open period. Create one under Payroll.</div>') + '</div>';
 }
 
+
+/* Phase 3: revenue-split distribution ledger for one invoice. */
+function viewDistribution(dist, inv) {
+  var h = '<div class="card" style="margin-top:16px"><h3>Revenue split <span class="sub">clearinghouse</span></h3>';
+  if (!dist) {
+    h += inv.status === "paid"
+      ? '<p class="muted">Paid and ready to split. Dry-run is the default — nothing moves until live payouts are armed in Settings.</p>' +
+        '<button class="btn small" onclick="Podium.distributeInvoice(\'' + inv.id + '\')">Distribute to execs</button>'
+      : '<p class="muted">Distribution unlocks when the invoice is paid. The split is pro-rata by billable hours in the invoice period.</p>';
+    return h + '</div>';
+  }
+  var mode = dist.distribution.mode;
+  var badge = mode === "live"
+    ? '<span class="pill closed">LIVE — transfers sent</span>'
+    : '<span class="pill open">DRY RUN — no money moved</span>';
+  var rows = dist.payouts.map(function (p) {
+    var st = p.status === "paid" ? '<span class="pill open">paid</span>'
+      : p.status === "failed" ? '<span class="pill closed" title="' + esc(p.failure || "") + '">failed</span>'
+      : p.status === "processing" ? '<span class="pill">processing</span>'
+      : '<span class="pill">pending</span>';
+    return '<tr><td><b>' + esc(p.person_name || "—") + '</b></td>' +
+      '<td class="num">' + money(p.gross_cents) + '</td>' +
+      '<td class="num muted">−' + money(p.spread_cents) + '</td>' +
+      '<td class="num"><b>' + money(p.net_cents) + '</b></td>' +
+      '<td>' + st + (p.stripe_transfer_id ? ' <span class="muted">' + esc(p.stripe_transfer_id) + '</span>' : "") + '</td></tr>';
+  }).join("");
+  var tg = dist.payouts.reduce(function (a, p) { return a + p.gross_cents; }, 0);
+  var ts = dist.payouts.reduce(function (a, p) { return a + p.spread_cents; }, 0);
+  var tn = dist.payouts.reduce(function (a, p) { return a + p.net_cents; }, 0);
+  h += '<div style="margin-bottom:10px">' + badge + ' <span class="muted">spread ' + esc(String(dist.distribution.spread_pct)) + '% · ' + esc((dist.distribution.ran_at || "").slice(0, 10)) + '</span></div>' +
+    '<table><tr><th>Exec</th><th class="num">Gross share</th><th class="num">Platform spread</th><th class="num">Net payout</th><th>Status</th></tr>' + rows +
+    '<tr><td><b>Total</b></td><td class="num"><b>' + money(tg) + '</b></td><td class="num"><b>−' + money(ts) + '</b></td><td class="num"><b>' + money(tn) + '</b></td><td></td></tr></table>' +
+    '<p class="muted">Gross → spread → net per exec, pro-rata by billable hours' + (mode === "dry_run" ? ". This was a dry run: computed and recorded, no Stripe transfers made." : ".") + '</p></div>';
+  return h;
+}
 function viewPods(pods) {
   var cards = pods.map(function (p) {
     return '<div class="card pod-card" onclick="location.hash=\'#/pod/' + p.id + '/channels\'">' +
@@ -584,7 +620,8 @@ function viewPeople(people, weekHours) {
       ? '<button class="conflict-badge" onclick="Podium.showConflicts(\'' + p.id + '\')">⚠ ' + cc[p.id] + '</button> ' : "";
     var tags = (p.skills || []).slice(0, 4).map(function (s) { return '<span class="skill-tag">' + esc(s) + '</span>'; }).join("");
     return '<div class="person-row"><div class="avatar">' + esc(initials) + '</div>' +
-      '<div class="who"><div class="nm">' + esc(p.name) + '</div><div class="ti">' + esc(p.title || "—") + (p.email ? " · " + esc(p.email) : "") + '</div>' +
+      '<div class="who"><div class="nm">' + esc(p.name) + '</div><div class="ti">' + esc(p.title || "—") + (p.email ? " · " + esc(p.email) : "") +
+      (p.stripe_connect_id ? ' · <span class="pill" title="Stripe Connect payout account">' + esc(p.stripe_connect_id) + '</span>' : "") + '</div>' +
       (tags ? '<div class="tags">' + tags + '</div>' : "") + '</div>' +
       '<div style="text-align:right"><div class="rate">' + money(p.hourly_rate_cents) + '/hr' +
       (p.rate_tier ? ' <span class="pill tier">' + esc(p.rate_tier) + '</span>' : "") + '</div>' +
@@ -609,6 +646,8 @@ function viewPeople(people, weekHours) {
     '</select></div></div>' +
     '<div style="margin-top:8px"><label>Skills (comma-separated)</label><input name="skills" id="person-skills" placeholder="fintech, turnaround, fundraising" maxlength="300"></div>' +
     '<div style="margin-top:8px"><label>Bio (shown on the client match page)</label><textarea name="bio" id="person-bio" rows="2" maxlength="600" placeholder="Two lines on background and edge."></textarea></div>' +
+    '<div style="margin-top:8px"><label>Payout account — Stripe Connect ID (e.g. acct_123)</label><input name="connect_id" id="person-connect" placeholder="acct_…" maxlength="60" autocomplete="off">' +
+    '<div class="muted">Where this exec\'s revenue-split payouts go. Only used when live payouts are armed.</div></div>' +
     '<div style="margin-top:10px"><button class="btn" type="submit">Save person</button> <button class="btn ghost" type="button" onclick="Podium.resetPersonForm()">Clear</button></div></form></div>';
 }
 
@@ -978,6 +1017,7 @@ function viewInvoices(invoices, detail, pods) {
       '<table style="margin-top:10px"><tr><th>Line</th><th class="num">Hours</th><th class="num">Rate</th><th class="num">Amount</th></tr>' +
       (rows || '<tr><td colspan="4" class="muted">No line items.</td></tr>') + '</table>' +
       '<div style="text-align:right;margin-top:10px;font-size:18px">Total <b>' + money(inv.amount_cents) + '</b></div>' +
+      viewDistribution(detail.distribution, inv) +
       '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
       (inv.status === "draft" ? '<button class="btn small" onclick="Podium.sendInvoice(\'' + inv.id + '\')">Send invoice</button>' : '') +
       ((inv.status === "draft" || inv.status === "sent") ? '<button class="btn small ghost" onclick="Podium.voidInvoice(\'' + inv.id + '\')">Void</button>' : '') +
@@ -1001,7 +1041,47 @@ function viewInvoices(invoices, detail, pods) {
     '<div><label>To</label><input type="date" name="period_end" required></div></div>' +
     '<div style="margin-top:10px"><button class="btn" type="submit">Generate draft</button></div>' +
     '<p class="muted">Hourly pods bill hours × each person\'s rate. Retainer pods bill the flat retainer rate.</p></form></div>';
+  h += viewBillingRuns(state.billingRuns);
+  h += viewPayoutLedger(state.payouts);
   return h;
+}
+
+/* Phase 3: 1st-of-month billing runs — manual trigger + history. */
+function viewBillingRuns(runs) {
+  runs = runs || [];
+  var rows = runs.map(function (r) {
+    var items = (r.items || []).map(function (it) {
+      return esc(it.pod_name || "") + " → " +
+        (it.via === "subscription" ? "subscription-billed" :
+          it.via === "invoice" ? (it.number || "invoiced") :
+          "error: " + esc(it.error || "?"));
+    }).join("<br>");
+    return '<tr><td><b>' + esc(r.run_month) + '</b></td><td>' + items + '</td><td class="muted">' + esc((r.ran_at || "").slice(0, 16).replace("T", " ")) + '</td></tr>';
+  }).join("");
+  var thisMonth = (new Date()).toISOString().slice(0, 7);
+  return '<div class="card"><h3>Billing runs <span class="sub">1st-of-month automation</span></h3>' +
+    '<div class="form-row"><div><label>Month</label><input type="month" id="billing-month" value="' + thisMonth + '"></div>' +
+    '<div style="align-self:end"><button class="btn small" type="button" onclick="Podium.runBilling()">Run billing</button></div></div>' +
+    '<p class="muted">Auto-runs on the 1st while the server is up. Subscription pods are billed by Stripe; the rest get generated + sent invoices. A month never runs twice unless forced.</p>' +
+    (rows ? '<table style="margin-top:8px"><tr><th>Month</th><th>Pods</th><th class="muted">Ran at</th></tr>' + rows + '</table>'
+      : '<p class="muted">No billing runs yet.</p>') + '</div>';
+}
+
+/* Phase 3: firm-wide payout ledger (recent first). */
+function viewPayoutLedger(payouts) {
+  payouts = (payouts || []).slice(0, 25);
+  var rows = payouts.map(function (p) {
+    var st = p.status === "paid" ? '<span class="pill open">paid</span>'
+      : p.status === "failed" ? '<span class="pill closed">failed</span>'
+      : '<span class="pill">pending</span>';
+    return '<tr><td><b>' + esc(p.person_name || "—") + '</b></td>' +
+      '<td class="muted">' + esc(p.invoice_number || "") + '</td>' +
+      '<td class="num">' + money(p.gross_cents) + '</td><td class="num muted">−' + money(p.spread_cents) + '</td>' +
+      '<td class="num"><b>' + money(p.net_cents) + '</b></td><td>' + st + '</td></tr>';
+  }).join("");
+  return '<div class="card"><h3>Payout ledger <span class="sub">clearinghouse</span></h3>' +
+    (rows ? '<table><tr><th>Exec</th><th>Invoice</th><th class="num">Gross</th><th class="num">Spread</th><th class="num">Net</th><th>Status</th></tr>' + rows + '</table>'
+      : '<p class="muted">No payouts yet — they appear when a paid invoice is distributed.</p>') + '</div>';
 }
 
 function viewSettings(s, templates) {
@@ -1033,6 +1113,13 @@ function viewSettings(s, templates) {
     '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn small" type="submit">Save Stripe settings</button>' +
     '<button class="btn small ghost" type="button" onclick="Podium.syncRetainers()">Sync retainer subscriptions</button></div>' +
     '<p class="muted">Test mode by default — nothing real moves until you flip to Live with a live key. Webhook: point Stripe at <code>/api/integrations/stripe/webhook</code>.</p></form></div>' +
+    '<div class="card"><h3>Clearinghouse — revenue split & payouts</h3><form onsubmit="return Podium.saveSettings(event,\'clearinghouse\')">' +
+    '<div class="form-row"><div><label>Platform spread % (agency cut)</label><input name="platform_spread_pct" type="number" min="0" max="90" step="0.5" value="' + esc((st.platform_spread_pct || {}).preview || "20") + '"></div>' +
+    '<div><label>Live payouts</label><select name="payouts_live">' +
+    '<option value="0"' + ((st.payouts_live || {}).preview !== "1" ? " selected" : "") + '>Dry run — compute only, no money moves</option>' +
+    '<option value="1"' + ((st.payouts_live || {}).preview === "1" ? " selected" : "") + '>LIVE — send Stripe Connect transfers</option></select></div></div>' +
+    '<div style="margin-top:10px"><button class="btn small" type="submit">Save clearinghouse settings</button></div>' +
+    '<p class="muted"><b>Dry run is the default and the safe choice.</b> Payouts are computed and recorded, but Stripe is only called when live payouts are armed here <i>and</i> Stripe is connected. Execs need a Stripe Connect account ID on their People record. The 1st-of-month billing scheduler runs while this server is up; a missed month can be backfilled from Invoices → Billing runs.</p></form></div>' +
     '<div class="card"><h3>Slack</h3><form onsubmit="return Podium.saveSettings(event,\'slack\')">' +
     '<div class="form-row">' + secretRow("slack_bot_token", "Bot token (xoxb-…)") + '</div>' +
     '<div style="margin-top:10px;display:flex;gap:8px"><button class="btn small" type="submit">Save</button>' +
@@ -1341,6 +1428,7 @@ var Podium = {
   freshBuilder: freshBuilder, talentLoadClass: talentLoadClass,
   viewObjectives: viewObjectives, viewAlerts: viewAlerts, viewValueLog: viewValueLog,
   viewSigningBanner: viewSigningBanner, blockPill: blockPill,
+  viewDistribution: viewDistribution, viewBillingRuns: viewBillingRuns, viewPayoutLedger: viewPayoutLedger,
 
   createPod: function (e) {
     e.preventDefault();
@@ -1484,6 +1572,7 @@ var Podium = {
       hourly_rate_cents: Math.round(Number(f.rate.value || 0) * 100),
       max_weekly_hours: f.maxh.value === "" ? null : Number(f.maxh.value),
       skills: f.skills.value, rate_tier: f.tier.value, bio: f.bio.value,
+      stripe_connect_id: f.connect_id.value,
     };
     var p = id ? api("PUT", "/api/people/" + id, body) : api("POST", "/api/people", body);
     p.then(function () { Podium.resetPersonForm(); loadPeople(); setOk("Saved."); }).catch(function (er) { setErr(er.message); });
@@ -1501,10 +1590,11 @@ var Podium = {
     document.getElementById("person-tier").value = pe.rate_tier || "";
     document.getElementById("person-skills").value = (pe.skills || []).join(", ");
     document.getElementById("person-bio").value = pe.bio || "";
+    document.getElementById("person-connect").value = pe.stripe_connect_id || "";
     document.getElementById("person-name").scrollIntoView({ block: "center" });
   },
   resetPersonForm: function () {
-    ["person-id", "person-name", "person-title", "person-email", "person-rate", "person-maxh", "person-tier", "person-skills", "person-bio"]
+    ["person-id", "person-name", "person-title", "person-email", "person-rate", "person-maxh", "person-tier", "person-skills", "person-bio", "person-connect"]
       .forEach(function (i) { var el = document.getElementById(i); if (el) el.value = ""; });
   },
 
@@ -1803,6 +1893,23 @@ var Podium = {
     if (!confirm("Void this invoice?")) return;
     api("POST", "/api/invoices/" + id + "/void")
       .then(function () { loadInvoices(id); setOk("Invoice voided."); })
+      .catch(function (er) { setErr(er.message); });
+  },
+  distributeInvoice: function (id) {
+    if (!confirm("Distribute this invoice's revenue to the pod's execs? (Dry-run unless live payouts are armed in Settings.)")) return;
+    api("POST", "/api/invoices/" + id + "/distribute")
+      .then(function (r) {
+        loadInvoices(id);
+        setOk(r.mode === "live" ? "Distributed — Stripe transfers sent." : "Distributed (dry run — no money moved).");
+      })
+      .catch(function (er) { setErr(er.message); });
+  },
+  runBilling: function () {
+    var m = document.getElementById("billing-month").value;
+    if (!m) { setErr("Pick a month first."); return; }
+    if (!confirm("Run 1st-of-month billing for " + m + "? Invoices retainer pods without subscriptions.")) return;
+    api("POST", "/api/billing/run", { month: m })
+      .then(function (r) { loadInvoices(); setOk("Billing run for " + r.month + ": " + r.items.length + " pod(s) processed."); })
       .catch(function (er) { setErr(er.message); });
   },
   pushQbo: function (id) {
